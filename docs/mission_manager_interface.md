@@ -1,8 +1,8 @@
 # CleanNav Mission Manager M0 接口设计
 
-> **状态：** M0-2 接口冻结候选（修订版）。
-> **边界：** 当前冻结 Topic、所有权、消息职责、字段语义、QoS、时间和坐标系；尚未修改或构建 `cleannav_interfaces`。
-> **后续依赖：** `TaskStatus.state` 与 `reason_code` 的最终枚举，需结合 `mission_manager_state_machine.md` 和 `mission_manager_reason_codes.md` 总审查后回填。
+> **状态：** M0-2 接口冻结候选（回填版）。
+> **边界：** 当前冻结 Topic、QoS、消息职责、字段语义、时间和坐标系；尚未修改或构建 `cleannav_interfaces`。
+> **回填：** 已依据 `mission_manager_state_machine.md` 和 `mission_manager_reason_codes.md` 完成第一轮回填。Topic、QoS、消息职责、时间和坐标系继续作为冻结候选。Reason 常量放在 `TaskStatus.msg` 还是独立 `ReasonCodes.msg`，留待 M0 总审查决定。
 
 ---
 
@@ -170,6 +170,7 @@ string interface_version
 string execution_id
 string command_id
 uint16 task_id
+uint8 status_scope
 uint8 state
 float32 progress
 string active_target_id
@@ -178,30 +179,132 @@ int32 reason_code
 string message
 ```
 
-当前模板的 `error_code` 建议改为 `reason_code`。
+相对于当前模板的变动：
 
-### 5.2 字段语义
+- 新增 `status_scope`——区分命令处理结果和 execution 生命周期；
+- `error_code` 改为 `reason_code`。
+
+### 5.2 status_scope
+
+冻结：
+
+```
+uint8 SCOPE_UNKNOWN   = 0
+uint8 SCOPE_COMMAND   = 1
+uint8 SCOPE_EXECUTION = 2
+```
+
+SCOPE_COMMAND：
+
+- 表示一条 `TaskCommand` 或 `SpatialGoalRequest` 的处理结果；
+- 用于 `ACCEPTED`、`REJECTED`、`QUEUED`、`SUCCEEDED`、`FAILED`、`CANCELED`；
+- `command_id` 为当前命令；
+- `execution_id` 尚不存在时为空；
+- 控制命令的成功只表示其副作用已经应用和收口，不表示受影响 mission 已经导航完成。
+
+SCOPE_EXECUTION：
+
+- 表示一个 mission execution 的生命周期；
+- `command_id` 使用创建该 execution 的原始普通 mission 的 command_id；
+- execution 激活后必须携带 `execution_id`；
+- PAUSE、STOP、RETURN_HOME、ESTOP 等控制命令自身的 `command_id` 不覆盖原 execution 的 `command_id`。
+
+### 5.3 字段语义
 
 | 字段 | 冻结语义 |
 |---|---|
 | `header.stamp` | 该状态生成时间，使用 ROS Clock |
 | `header.frame_id` | 空 |
 | `execution_id` | 一次普通 mission 或返航 mission 的实例标识；拒绝前无法创建 execution 时可为空 |
-| `command_id` | 触发该状态的原始 HMI 请求 ID |
+| `command_id` | `SCOPE_COMMAND` 时为当前命令 ID；`SCOPE_EXECUTION` 时为创建该 execution 的原始普通 mission command_id |
 | `task_id` | 对应 Task Catalog 编号 |
-| `state` | 对外简化状态；不暴露全部内部中间状态 |
-| `progress` | 正常范围 0.0～1.0 |
+| `state` | 对外简化状态；不暴露全部内部中间状态。冻结枚举见本节 state 对照表 |
+| `progress` | 正常范围 0.0～1.0；不可用时为 -1.0 |
 | `active_target_id` | 视觉任务关联目标；无目标时为空 |
-| `remaining_distance_m` | 可计算时为非负值 |
-| `reason_code` | 正常、等待、拒绝、取消、失败和安全阻断原因 |
+| `remaining_distance_m` | 可计算时为非负值；不可用时为 -1.0 |
+| `reason_code` | 正常、等待、拒绝、取消、失败和安全阻断原因。精确数值由 `mission_manager_reason_codes.md` 冻结（非负 int32） |
 | `message` | 人类可读说明，不参与程序控制 |
 
-### 5.3 规则
+### 5.4 对外状态枚举（冻结，共 17 个值）
 
-- `state` 的最终常量由状态机文档冻结；
-- `reason_code` 的最终常量由 Reason Code 文档冻结；
-- progress 与 remaining_distance 的“不可用”表示方式必须在接口包修订前冻结；
-- TaskStatus 必须支持 command_id 幂等重放；
+引用自 `mission_manager_state_machine.md`：
+
+```
+uint8 STATE_UNKNOWN=0
+uint8 STATE_IDLE=1
+uint8 STATE_ACCEPTED=2
+uint8 STATE_REJECTED=3
+uint8 STATE_QUEUED=4
+uint8 STATE_WAITING_TARGET=5
+uint8 STATE_PREPARING=6
+uint8 STATE_NAVIGATING=7
+uint8 STATE_PAUSING=8
+uint8 STATE_PAUSED=9
+uint8 STATE_CANCELING=10
+uint8 STATE_RETURNING_HOME=11
+uint8 STATE_SAFETY_BLOCKED=12
+uint8 STATE_SUCCEEDED=13
+uint8 STATE_CANCELED=14
+uint8 STATE_FAILED=15
+uint8 STATE_EMERGENCY_STOPPED=16
+```
+
+规则：
+
+- 不增加 `STATE_APPLIED`；
+- Command Record 的 APPLIED/TERMINAL 成功对外映射为 `SCOPE_COMMAND` + `STATE_SUCCEEDED`；
+- 内部 FINALIZING 不直接暴露为外部状态；
+- 不把全部内部状态逐一暴露给 HMI。
+
+### 5.5 Reason Code
+
+精确数值区间由 `docs/mission_manager_reason_codes.md` 冻结。核心原则：
+
+| 区间 | 分类 |
+|------|------|
+| 0 | NONE |
+| 1–99 | 正常生命周期 |
+| 100–199 | 命令校验 |
+| 200–299 | Task Catalog 与队列 |
+| 300–399 | 感知与目标 |
+| 400–499 | Navigation |
+| 500–599 | Safety 与 Lease |
+| 600–699 | 超时、stale 与时钟 |
+| 700–799 | 收口、状态机与合同 |
+| 800–899 | 预留 |
+| 900–999 | 内部错误 |
+
+冻结规则：
+
+- `reason_code` 使用非负 int32；
+- 已发布数值不得改变含义或复用；
+- `message` 不替代 `reason_code`；
+- Adapter 不得直接透传 Action 数值、String 状态或日志文本；
+- 底层状态必须映射为稳定 Reason Code；
+- 未映射错误使用对应内部映射缺失原因并 HOLD_QUEUE。
+
+### 5.6 队列项过期
+
+冻结语义：
+
+- 新命令接收时已经过期：`SCOPE_COMMAND` + `STATE_REJECTED`；
+- 已经 ACCEPTED/QUEUED、但激活前过期：`SCOPE_COMMAND` + `STATE_CANCELED`；
+- `reason_code` 使用 `REASON_QUEUED_COMMAND_EXPIRED`；
+- 不创建 execution_id，不执行该任务。
+
+### 5.7 规则
+
+- `state` 常量已由状态机文档冻结（17 个值，见 5.4）；
+- `reason_code` 常量已由 Reason Code 文档冻结（区间见 5.5，完整数值见 `docs/mission_manager_reason_codes.md`）；
+- `progress` 有效范围 0.0–1.0，不可用时为 -1.0；
+- `remaining_distance_m` 有效时 >=0，不可用时为 -1.0；
+- REJECTED 且尚未创建 execution 时 `execution_id` 为空；
+- QUEUED 时 `execution_id` 为空；
+- execution 激活后 `execution_id` 必须非空；
+- `message` 只供人读，不用于程序控制；
+- 程序只能依据 `status_scope`、`state`、`reason_code` 和 ID 字段；
+- Terminal TaskStatus 必须缓存，用于 `command_id` 幂等重放；
+- 相同 `command_id` 的幂等重放可以再次发布缓存状态，但不得重复执行任何副作用；
 - HMI 不得根据 `message` 文本驱动逻辑；
 - TRANSIENT_LOCAL 的历史状态只用于恢复显示，不得触发任务执行。
 
@@ -234,9 +337,9 @@ string message
 | `system_state` | 面向 HMI 的综合状态，不等同于 TaskStatus.state |
 | `localization_ok` | false 时 pose 不得被消费者使用 |
 | `pose` | localization_ok=true 时的 `map` 位姿 |
-| `navigation_active` | 当前存在活动 navigation generation |
+| `navigation_active` | 当前存在活动或清理中的 navigation generation；发出 cancel 请求不等于 navigation_active=false；只有导航确认结束后才变为 false |
 | `emergency_stop_active` | 来自结构化 Safety Snapshot 或等价可信输入 |
-| `autonomous_enabled` | Safety 当前是否实际授权 |
+| `autonomous_enabled` | Safety 当前是否实际授权。navigation_active 与 autonomous_enabled 不能混为同一字段——导航可以已接受但 Safety 尚未授权，Safety 可以回锁而导航取消仍在确认中 |
 | `linear_velocity_mps` | 机器人测量线速度，优先来自 odometry，不是候选或最终命令速度 |
 | `angular_velocity_rps` | 机器人测量角速度，优先来自 odometry |
 | `message` | 人类可读摘要 |
@@ -325,7 +428,9 @@ CleaningTarget：
 - 不直接写 Costmap；
 - 不直接成为 `/goal_pose`；
 - 普通位置更新不自动触发新 Goal；
-- 目标失效或显著偏移需要重规划时，必须先取消旧 generation 并等待确认。
+- 目标失效或显著偏移需要重规划时，必须先取消旧 generation 并等待确认；
+- 执行中目标明确为 INVALID 或 EXPIRED 时，M1 默认将当前 execution 结束为 FAILED；
+- M1 默认不自动重选目标；自动重选和创建新 generation 属于后续可配置策略。
 
 ---
 
@@ -419,7 +524,10 @@ builtin_interfaces/Duration valid_for
 - `now_ros > header.stamp + valid_for` 时拒绝；
 - 不用于速度控制；
 - 不直接发布 `/goal_pose`；
-- 不属于 M1 当前验收。
+- 不属于 M1 当前验收；
+- 它未来也使用相同 `status_scope`、`state` 和 `reason_code` 返回处理结果；
+- 正式 v1.0 不生成也不订阅 `SpatialGoalRequest`；若未来已经生成该消息、但功能开关关闭或接口版本不支持，则以 `REASON_SPATIAL_GOAL_NOT_SUPPORTED_IN_VERSION` 拒绝；
+- 相对目标负 x 默认拒绝，不能绕过当前禁止倒车策略。
 
 ---
 
@@ -503,8 +611,10 @@ task-specific parameters
 
 ## 14. 时间与坐标系合同
 
+### 14.1 语义时间（使用 ROS Clock）
+
 | 接口 | 时间语义 | frame_id |
-|---|---|---|
+|------|----------|----------|
 | TaskCommand | Bridge 生成请求时间；ROS Clock | 空 |
 | TaskStatus | 状态生成时间；ROS Clock | 空 |
 | RobotStatus | 综合状态采样时间；ROS Clock | pose 有效时 `map`，无效时空 |
@@ -515,6 +625,14 @@ task-specific parameters
 | SpatialGoalRequest absolute pose | 空间参考时间 | `map` |
 | SpatialGoalRequest relative pose | 相对指令参考时间 | `base_footprint` |
 
+ROS Clock 用于：
+
+- TaskCommand valid_for
+- queued command expiry
+- CleaningTarget valid_for
+- target wait timeout
+- execution 语义超时
+
 过期公式：
 
 ```text
@@ -522,11 +640,29 @@ request_expired = now_ros > request_stamp + valid_for
 target_expired  = now_ros > observation_stamp + valid_for
 ```
 
-Safety Lease 当前使用 `time.monotonic()` 墙钟：
+### 14.2 运行看门狗（使用可注入 monotonic）
+
+- navigation accept timeout
+- navigation cancel timeout
+- Lease acquire / renew / release timeout
+- Navigation Snapshot stale timeout
+- Safety Snapshot stale timeout
+- PerceptionHealth 到达 stale timeout
+- emergency clear confirmation timeout
+
+说明：
+
+- `header.stamp` 的过期判断和本地消息到达 stale 看门狗可以同时存在；
+- `/clock` 暂停时，运行看门狗仍需推进；
+- M1 Mock 不得依赖真实 sleep，必须支持可注入时钟。
+
+### 14.3 Safety Lease 时钟
+
+当前 Safety Lease 使用 `time.monotonic()` 墙钟：
 
 - 仿真 `/clock` 暂停时 Lease 仍可能到期；
 - 这是当前安全保守行为，但真实 Adapter 必须显式处理；
-- Lease 续期定时器使用 ROS Clock 还是 monotonic 墙钟，留待真实 Safety Adapter 文档冻结。
+- Lease 续期定时器的具体时间源留待真实 Safety Adapter 文档冻结。
 
 ---
 
@@ -537,6 +673,9 @@ Safety Lease 当前使用 `time.monotonic()` 墙钟：
 当前 `rosidl_generate_interfaces` 基本结构正确，但正式 v1.0 应：
 
 - 生成 TaskCommand、TaskStatus、RobotStatus、CleaningTarget、CleaningTargetArray、PerceptionHealth；
+- TaskStatus 必须回填 `status_scope` 和 0–16 状态常量；
+- Reason 常量直接放入 `TaskStatus.msg` 或拆成 `ReasonCodes.msg`，在 M0 总审查决定。无论采用哪种组织方式，对外数值必须严格等于 `mission_manager_reason_codes.md`；
+- 若拆成独立 `ReasonCodes.msg`，必须同时将其加入 `rosidl_generate_interfaces` 生成列表；
 - 不生成 ManualDriveRequest；
 - SpatialGoalRequest 在 v1.1 正式启用前不生成；
 - 若 config 目录要随包安装，增加：
@@ -566,7 +705,7 @@ install(
 - README 和自研消息注释改为中文；
 - 清楚区分 v1.0、v1.1 预留和未来未定；
 - 不把 ManualDriveRequest 写成 v1.1；
-- 状态机和 Reason Code 完成前，不冻结 TaskStatus 最终常量。
+- 状态机和 Reason Code 已完成第一轮冻结；正式接口包必须严格依据两份权威文档回填，后续变更需走接口变更控制。
 
 ### 15.4 字符串边界
 
@@ -604,10 +743,8 @@ ROS 2 接口支持 bounded string。接口包修订时应优先为自定义字�
 ## 17. 当前未决项
 
 | 项目 | 状态 |
-|---|---|
-| TaskStatus.state 最终枚举 | 等待状态机文档 |
-| TaskStatus.reason_code 最终数值 | 等待 Reason Code 文档 |
-| progress 与 remaining_distance 的不可用值 | 待冻结 |
+|---|---:|
+| Reason 常量的消息组织方式（TaskStatus.msg vs 独立 ReasonCodes.msg） | 待 M0 总审查决定 |
 | 自定义字符串最终上界 | 接口包修订前冻结 |
 | RobotStatus 电池字段 | 候选 |
 | CleaningTarget 最终目标类型集合 | 与感知组确认 |
@@ -621,17 +758,16 @@ ROS 2 接口支持 bounded string。接口包修订时应优先为自定义字�
 | home_pose、固定点、默认队列和路线配置 | 待完成 |
 | 真实 Adapter 如何获得任务关联的 accepted/cancel/result | 等待 A* 与 Path Bridge 修复 |
 | Lease 续期定时器时间源 | 待真实 Safety Adapter 冻结 |
+| RESET ESTOP 的外部安全确认来源 | 待确定 |
 
 ---
 
 ## 18. 后续顺序
 
-1. 审查并冻结本接口文档；
-2. 创建 `mission_manager_state_machine.md`；
-3. 创建 `mission_manager_reason_codes.md`；
-4. 回填 TaskStatus.state 和 reason_code；
-5. 创建 `mission_manager_test_plan.md`；
-6. 修订 `cleannav_interfaces` 候选包；
-7. 构建接口包并执行静态验证；
-8. 执行 M0 总审查；
-9. 进入 M1 Mock 包骨架。
+1. 审查本次接口回填；
+2. 创建 `mission_manager_test_plan.md`；
+3. 修订 `cleannav_interfaces` 候选包（msg 注释中文化、回填枚举、package.xml 修正）；
+4. 构建并静态验证接口包；
+5. 更新 PROJECT_STATUS；
+6. M0 总审查；
+7. M1 Mock 包骨架。
