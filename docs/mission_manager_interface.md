@@ -1,8 +1,8 @@
 # CleanNav Mission Manager M0 接口设计
 
-> **状态：** M0-2 接口冻结候选（回填版）。
-> **边界：** 当前冻结 Topic、QoS、消息职责、字段语义、时间和坐标系；尚未修改或构建 `cleannav_interfaces`。
-> **回填：** 已依据 `mission_manager_state_machine.md` 和 `mission_manager_reason_codes.md` 完成第一轮回填。Topic、QoS、消息职责、时间和坐标系继续作为冻结候选。Reason 常量放在 `TaskStatus.msg` 还是独立 `ReasonCodes.msg`，留待 M0 总审查决定。
+> **状态：** M0-2 接口冻结候选（M0 总审查回填版）。
+> **边界：** 本文冻结 Topic、QoS、消息职责、字段语义、时间和坐标系；`cleannav_interfaces` v1.0 候选包已落地并完成首次构建验证。
+> **实现决定：** v1.0 Reason 常量直接定义在 `TaskStatus.msg`，不创建独立 `ReasonCodes.msg`；bounded string 上界以当前已构建消息定义为准。
 
 ---
 
@@ -12,13 +12,13 @@
 
 当前事实：
 
-- `cleannav_interfaces_v1_0_template.zip` 只是未投入使用的候选模板，可以修改；
-- 当前尚未创建 `src/cleannav_interfaces`；
-- 当前尚未执行接口包构建；
-- M1 只使用 v1.0 组间接口和 Mock Adapter；
-- `SpatialGoalRequest` 仅作为 v1.1 预留；
-- `ManualDriveRequest` 不属于当前 v1.0，也不属于当前已冻结的 v1.1；
-- 本文不把 B1-4g 单路径隔离实验扩大为 Continuous Navigation V1 已完成。
+- `src/cleannav_interfaces` 已创建，当前 v1.0 候选包是接口实现的权威来源；旧 `cleannav_interfaces_v1_0_template.zip` 仅保留为历史参考；
+- v1.0 当前只生成 TaskCommand、TaskStatus、RobotStatus、CleaningTarget、CleaningTargetArray、PerceptionHealth 共 6 个消息；
+- 接口包已完成静态一致性检查和 `colcon build --packages-select cleannav_interfaces` 首次构建验证；6 个接口可由 `ros2 interface show` 识别并完成 Python 导入，3 个配置文件已安装；
+- M1 尚未开始，只允许使用 v1.0 组间接口和 Mock Navigation/Safety Adapter；
+- `SpatialGoalRequest` 仅作为 v1.1 文档预留，当前不生成、不订阅；
+- `ManualDriveRequest` 不属于当前 v1.0，也不属于当前 v1.1，正式候选包不生成该消息；
+- 本文不把 B1-4g 单路径隔离实验扩大为 Continuous Navigation V1 已完成，也不把当前 `/goal_pose` 写成具备完整 accepted/cancel/result 合同。
 
 ---
 
@@ -92,16 +92,16 @@
 
 ## 4. TaskCommand
 
-### 4.1 当前模板字段
+### 4.1 v1.0 已实现字段
 
 ```text
 std_msgs/Header header
-string interface_version
-string command_id
+string<=16 interface_version
+string<=128 command_id
 uint8 source
 uint16 task_id
 float32 confidence
-string raw_text
+string<=512 raw_text
 builtin_interfaces/Duration valid_for
 ```
 
@@ -148,41 +148,42 @@ TaskCommand 的语义比较至少包括：
 
 不同 `command_id` 可以重复执行相同 `task_id`。
 
-### 4.5 字符串边界候选
+### 4.5 v1.0 已实现字符串边界
 
-为提高 J6M 侧资源可控性，正式模板建议使用 bounded string：
+v1.0 已采用 bounded string：
 
-- `interface_version`：不超过 16 字符；
-- `command_id`：1～128 字符，与 APP JSON 上限一致；
-- `raw_text`：不超过 512 字符。
+- `interface_version`：`string<=16`；
+- `command_id`：`string<=128`，APP JSON 同步限制为 1～128 字符；
+- `raw_text`：`string<=512`。
 
-最终允许字符集在接口包修订前冻结；建议 command_id 仅允许字母、数字、点、下划线、冒号和连字符。
+`command_id` 的 APP JSON 格式冻结为 `^[A-Za-z0-9._:-]+$`。上述上界已经进入当前已构建接口；后续若改变，需要按接口版本与变更控制处理。
 
 ---
 
 ## 5. TaskStatus
 
-### 5.1 候选字段
+### 5.1 v1.0 已实现字段
 
 ```text
 std_msgs/Header header
-string interface_version
-string execution_id
-string command_id
+string<=16 interface_version
+string<=64 execution_id
+string<=128 command_id
 uint16 task_id
 uint8 status_scope
 uint8 state
 float32 progress
-string active_target_id
+string<=128 active_target_id
 float32 remaining_distance_m
 int32 reason_code
-string message
+string<=512 message
 ```
 
-相对于当前模板的变动：
+v1.0 当前实现已经完成：
 
-- 新增 `status_scope`——区分命令处理结果和 execution 生命周期；
-- `error_code` 改为 `reason_code`。
+- `status_scope` 已进入 `TaskStatus.msg`，用于区分命令处理结果和 execution 生命周期；
+- 已统一使用 `reason_code`，不存在旧 `error_code` 字段；
+- 0～16 状态常量和正式 Reason 常量均直接定义在 `TaskStatus.msg`。
 
 ### 5.2 status_scope
 
@@ -312,11 +313,11 @@ uint8 STATE_EMERGENCY_STOPPED=16
 
 ## 6. RobotStatus
 
-### 6.1 当前模板字段
+### 6.1 v1.0 已实现字段
 
 ```text
 std_msgs/Header header
-string interface_version
+string<=16 interface_version
 uint8 system_state
 bool localization_ok
 geometry_msgs/Pose pose
@@ -325,7 +326,7 @@ bool emergency_stop_active
 bool autonomous_enabled
 float32 linear_velocity_mps
 float32 angular_velocity_rps
-string message
+string<=256 message
 ```
 
 ### 6.2 冻结语义
@@ -372,9 +373,9 @@ RobotStatus 不替代 TaskStatus，也不应把 `safety_supervisor_status` 字�
 - `valid_for` 从 `header.stamp` 起计算；
 - `projection_valid=false` 时不得生成导航目标。
 
-### 7.2 目标类型候选
+### 7.2 v1.0 已实现目标类型
 
-建议使用连续编号：
+当前 `CleaningTarget.msg` 使用以下连续编号：
 
 ```text
 TYPE_UNKNOWN=0
@@ -385,11 +386,11 @@ TYPE_BOTTLE_CAN=4
 TYPE_PAPER_TRASH=5
 ```
 
-其中 BOTTLE_CAN 和 PAPER_TRASH 只是接口候选，不自动进入 v1.0 Demo 验收；最终类型集合需与感知组确认。
+上述 0～5 数值已经进入 v1.0 消息合同；BOTTLE_CAN 和 PAPER_TRASH 是否进入当前比赛 Demo 仍可由任务配置决定，但不得在 v1.0 内改变既有数值语义。新增目标类型应向后追加并经过接口变更审查。
 
-### 7.3 observation_state 修订
+### 7.3 observation_state 已实现定义
 
-当前模板从 `OBSERVATION_NEW=0` 开始，默认构造消息会被误认为 NEW。建议修订为：
+当前 `CleaningTarget.msg` 已采用安全默认值 `OBSERVATION_UNKNOWN=0`：
 
 ```text
 OBSERVATION_UNKNOWN=0
@@ -533,16 +534,16 @@ builtin_interfaces/Duration valid_for
 
 ## 11. ManualDriveRequest
 
-当前模板包含 `msg/ManualDriveRequest.msg`，但项目当前明确不做 APP 手动遥控。
+旧模板曾包含 `msg/ManualDriveRequest.msg`，但当前正式候选包已经不包含、也不生成该消息。
 
 冻结结论：
 
 - 不纳入接口 v1.0；
-- 不纳入当前已冻结的 v1.1；
-- 正式 v1.0 的 `rosidl_generate_interfaces` 不应生成该消息；
-- 候选文件可以移动到非生成的 `draft/` 目录，或在接口包落地时删除；
+- 不纳入当前 v1.1；
+- 当前 `rosidl_generate_interfaces` 不生成该消息；
+- `src/cleannav_interfaces` 中不存在该 `.msg`；
 - README 不得把它写成 v1.1 已支持接口；
-- 后续是否恢复必须单独立项，并重新审查 Safety 仲裁和 deadman 语义。
+- 后续如需恢复 APP 手动遥控，必须单独立项并重新审查 Safety 仲裁、deadman 与权限边界。
 
 ---
 
@@ -564,23 +565,22 @@ task-specific parameters
 
 `task_kind` 是普通 Mission Queue 与控制事件分流的权威字段。
 
-### 12.2 当前模板问题
+### 12.2 v1.0 当前配置状态
 
-| task_id | 当前问题 | 冻结处理 |
+| task_id | 当前状态 | v1.0 处理 |
 |---:|---|---|
-| 1 START_DEFAULT_CLEANING | 默认队列或默认路线未定义；当前 range 名称 system_control 与其 mission 语义不一致 | `task_kind=MISSION`；配置默认任务前设为 disabled |
-| 2 PAUSE_CURRENT_TASK | 旧描述只强调关闭 autonomous | 更新为 release Lease、cancel、等待 confirmed 后暂停 |
-| 3 RESUME_CURRENT_TASK | 需创建新 generation | `task_kind=CONTROL` |
-| 4 STOP_CURRENT_TASK | 需清空普通等待队列 | `task_kind=CONTROL` |
-| 5 RETURN_HOME | home_pose 未定义 | 配置 home_pose 前 disabled；执行时终止旧任务并创建新返航 execution |
-| 6 SOFTWARE_EMERGENCY_STOP | 不能进入普通队列 | `task_kind=CONTROL`，最高优先级 |
-| 7 RESET_SOFTWARE_EMERGENCY_STOP | 必须确认安全条件 | 只允许 APP/MOCK；`requires_confirmation=true` |
-| 10 GOTO_POINT_1 | `(0,0,0)` 只是占位 | 配置真实固定点前 disabled |
-| 20 CLEAN_ROUTE_1 | route_1 未定义 | 配置路线前 disabled |
+| 1 START_DEFAULT_CLEANING | disabled | `task_kind=MISSION`；默认队列/路线未配置前不得启用 |
+| 2 PAUSE_CURRENT_TASK | enabled | `task_kind=CONTROL`；release Lease、cancel 并等待 confirmed，保留 execution_id 与普通队列 |
+| 3 RESUME_CURRENT_TASK | enabled | `task_kind=CONTROL`；从 PAUSED/可恢复 SAFETY_BLOCKED 创建新 generation |
+| 4 STOP_CURRENT_TASK | enabled | `task_kind=CONTROL`；安全收口并清空普通等待队列 |
+| 5 RETURN_HOME | disabled | `task_kind=CONTROL`；home_pose 未配置前拒绝且不得破坏当前任务/队列 |
+| 6 SOFTWARE_EMERGENCY_STOP | enabled | `task_kind=CONTROL`；最高优先级，不进入普通队列 |
+| 7 RESET_SOFTWARE_EMERGENCY_STOP | enabled | 仅 APP/MOCK，`requires_confirmation=true`，语音不得解除急停 |
+| 10 GOTO_POINT_1 | disabled | `goal_pose: null`；配置真实固定点前不得启用 |
+| 20 CLEAN_ROUTE_1 | disabled | `route_id: ""`；配置路线前不得启用 |
+| 30～33 视觉目标任务 | enabled | M1 Mock 可用；参数仍是候选运行参数，不扩大为实车已验证值 |
 
-建议将 `ranges.system_control` 改名为更中性的 `system_command`，或明确 task_kind 才是执行分流依据。
-
-视觉目标 mission 可以在 Mock 阶段启用，但目标类型、完成半径和等待超时仍需通过测试计划验证。
+`ranges.system_command` 已作为 1～9 的范围名称；`task_kind` 是普通 FIFO Mission 与 CONTROL 分流的权威字段。所有 task 都必须显式给出 `requires_confirmation`，当前仅 Task 7 为 true。
 
 ---
 
@@ -666,61 +666,80 @@ target_expired  = now_ros > observation_stamp + valid_for
 
 ---
 
-## 15. 接口包构建元数据审查
+## 15. 接口包当前实现与构建基线
 
 ### 15.1 CMakeLists.txt
 
-当前 `rosidl_generate_interfaces` 基本结构正确，但正式 v1.0 应：
+当前 `rosidl_generate_interfaces` 已冻结为只生成 6 个 v1.0 消息：
 
-- 生成 TaskCommand、TaskStatus、RobotStatus、CleaningTarget、CleaningTargetArray、PerceptionHealth；
-- TaskStatus 必须回填 `status_scope` 和 0–16 状态常量；
-- Reason 常量直接放入 `TaskStatus.msg` 或拆成 `ReasonCodes.msg`，在 M0 总审查决定。无论采用哪种组织方式，对外数值必须严格等于 `mission_manager_reason_codes.md`；
-- 若拆成独立 `ReasonCodes.msg`，必须同时将其加入 `rosidl_generate_interfaces` 生成列表；
+- TaskCommand；
+- TaskStatus；
+- RobotStatus；
+- CleaningTarget；
+- CleaningTargetArray；
+- PerceptionHealth。
+
+同时冻结：
+
+- Reason 常量直接定义在 `TaskStatus.msg`，不创建独立 `ReasonCodes.msg`；
 - 不生成 ManualDriveRequest；
-- SpatialGoalRequest 在 v1.1 正式启用前不生成；
-- 若 config 目录要随包安装，增加：
+- 不生成 SpatialGoalRequest；
+- `config/` 通过 `install(DIRECTORY config DESTINATION share/${PROJECT_NAME})` 安装；
+- `ament_export_dependencies(rosidl_default_runtime)` 保留。
 
-```cmake
-install(
-  DIRECTORY config
-  DESTINATION share/${PROJECT_NAME}
-)
-```
-
-否则 task_catalog、APP schema 和语音映射不会作为安装产物进入 `install/share/cleannav_interfaces`。
+当前接口包已经通过首次 `colcon build --packages-select cleannav_interfaces`；6 个接口均可被 `ros2 interface show` 发现并完成 Python 导入。
 
 ### 15.2 package.xml
 
-后续修订：
+当前 manifest 已完成接口包所需元数据：
 
-- `rosidl_default_generators` 使用 `buildtool_depend`；
-- 保留 `rosidl_default_runtime` 的 `exec_depend`；
-- 保留 `member_of_group`；
-- 替换 `maintainer@example.com` 占位邮箱；
-- 保持 `ament_cmake` 构建类型。
+- package format=3；
+- `ament_cmake` 构建类型；
+- `rosidl_default_generators` 为 buildtool dependency；
+- `builtin_interfaces`、`std_msgs`、`geometry_msgs` 为接口依赖；
+- `rosidl_default_runtime` 为运行依赖；
+- `member_of_group=rosidl_interface_packages`；
+- 维护者邮箱已替换为可通过 package manifest 校验的有效地址。
 
-### 15.3 README 与注释
+具体维护者地址以 `src/cleannav_interfaces/package.xml` 为唯一权威来源，不在本设计文档重复维护。
 
-- “frozen interface contract” 改为“候选接口包”；
-- README 和自研消息注释改为中文；
-- 清楚区分 v1.0、v1.1 预留和未来未定；
-- 不把 ManualDriveRequest 写成 v1.1；
-- 状态机和 Reason Code 已完成第一轮冻结；正式接口包必须严格依据两份权威文档回填，后续变更需走接口变更控制。
+### 15.3 README 与配置文件
 
-### 15.4 字符串边界
+当前候选包已明确：
 
-ROS 2 接口支持 bounded string。接口包修订时应优先为自定义字符串设置上界，至少覆盖：
+- README 使用“v1.0 候选接口包”，不冒充最终 frozen contract；
+- README 与自研消息注释已中文化；
+- v1.0、v1.1 预留与未来未定边界明确；
+- ManualDriveRequest 不属于 v1.1；
+- `task_catalog.yaml`、`app_task_schema.json`、`voice_task_map_example.yaml` 均随包安装。
 
-- interface_version
-- command_id
-- execution_id
-- target_id
-- source
-- class_name
-- raw_text
-- message
+### 15.4 v1.0 bounded string 冻结值
 
-具体上界应兼顾 APP JSON、日志可读性和 J6M 资源约束。
+ROS 2 消息中的字符串上界以当前已构建 `.msg` 为准：
+
+| 消息 | 字段 | 上界 |
+|---|---|---:|
+| TaskCommand | interface_version | 16 |
+| TaskCommand | command_id | 128 |
+| TaskCommand | raw_text | 512 |
+| TaskStatus | interface_version | 16 |
+| TaskStatus | execution_id | 64 |
+| TaskStatus | command_id | 128 |
+| TaskStatus | active_target_id | 128 |
+| TaskStatus | message | 512 |
+| RobotStatus | interface_version | 16 |
+| RobotStatus | message | 256 |
+| CleaningTarget | interface_version | 16 |
+| CleaningTarget | target_id | 128 |
+| CleaningTarget | source | 64 |
+| CleaningTarget | class_name | 64 |
+| CleaningTargetArray | interface_version | 16 |
+| CleaningTargetArray | source | 64 |
+| PerceptionHealth | interface_version | 16 |
+| PerceptionHealth | source | 64 |
+| PerceptionHealth | message | 256 |
+
+上述值不再属于 M0 未决项。未来若修改，应走接口版本/兼容性变更审查。
 
 ---
 
@@ -742,32 +761,34 @@ ROS 2 接口支持 bounded string。接口包修订时应优先为自定义字�
 
 ## 17. 当前未决项
 
-| 项目 | 状态 |
-|---|---:|
-| Reason 常量的消息组织方式（TaskStatus.msg vs 独立 ReasonCodes.msg） | 待 M0 总审查决定 |
-| 自定义字符串最终上界 | 接口包修订前冻结 |
-| RobotStatus 电池字段 | 候选 |
-| CleaningTarget 最终目标类型集合 | 与感知组确认 |
-| 感知 stale timeout | 配置值待定 |
-| 视觉目标失效与显著偏移阈值 | 待状态机/感知联合审查 |
+以下事项不阻塞 M0 接口合同冻结：
+
+| 项目 | 状态 / 决策时点 |
+|---|---|
+| RobotStatus 电池字段 | 当前 v1.0 不增加；需要时以后续版本扩展 |
+| CleaningTarget 后续新增目标类型 | 当前 0～5 数值保持不变；新增类型需接口变更审查 |
+| 感知 stale timeout 默认数值 | M1 参数冻结，不写入消息 |
+| 视觉目标显著偏移阈值 | M1/感知联合验证后决定 |
 | SpatialGoalRequest 最终启用时点 | v1.1 预留 |
-| APP/语音确认协议 | 当前未定义；因此 SpatialGoalRequest 暂无 require_confirmation 字段 |
-| ManualDriveRequest 文件最终删除或 draft 保存 | 待接口包修订决定 |
-| 结构化 SafetyStatus | 未来候选 |
-| 专用 Safety Lease Service | 未来候选 |
-| home_pose、固定点、默认队列和路线配置 | 待完成 |
+| APP/语音确认协议 | v1.1/HMI 协议；当前 SpatialGoalRequest 不含 require_confirmation |
+| ManualDriveRequest 是否未来恢复 | 当前 v1.0/v1.1 均不支持；若恢复需单独立项 |
+| 结构化 SafetyStatus | 真实 Safety Adapter 前决定 |
+| 专用 Safety Lease Service | 真实 Safety Adapter 前决定 |
+| home_pose、固定点、默认队列和路线配置 | M1/产品配置阶段完成 |
 | 真实 Adapter 如何获得任务关联的 accepted/cancel/result | 等待 A* 与 Path Bridge 修复 |
-| Lease 续期定时器时间源 | 待真实 Safety Adapter 冻结 |
-| RESET ESTOP 的外部安全确认来源 | 待确定 |
+| Lease release 失败是否自动触发软件 ESTOP | 真实 Safety Adapter/安全策略冻结 |
+| Lease 续期定时器时间源 | 真实 Safety Adapter 冻结 |
+| RESET ESTOP 的外部安全确认来源 | 真实 Safety Adapter 前确定 |
+
+已从未决项移除：Reason 常量组织方式、bounded string 上界、ManualDriveRequest 在当前正式候选包中的处理方式；这些均已由 v1.0 当前实现确定。
 
 ---
 
 ## 18. 后续顺序
 
-1. 审查本次接口回填；
-2. 创建 `mission_manager_test_plan.md`；
-3. 修订 `cleannav_interfaces` 候选包（msg 注释中文化、回填枚举、package.xml 修正）；
-4. 构建并静态验证接口包；
-5. 更新 PROJECT_STATUS；
-6. M0 总审查；
-7. M1 Mock 包骨架。
+1. 用本 M0 总审查回填版替换旧接口文档；
+2. 与 `mission_manager_state_machine.md` 的 M0 总审查回填版一起执行最终跨文档检查；
+3. 修订并重新生成 `mission_manager_m0_total_audit.md`，以当前源码和文档为准；
+4. 更新 `PROJECT_STATUS.md`，将 M0 从“候选基线”收口为最终冻结；
+5. 提交 M0 冻结基线；
+6. 进入 M1 `cleannav_mission_manager` Mock 包骨架，不接真实 Navigation/Safety Adapter。

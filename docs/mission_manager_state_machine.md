@@ -1,8 +1,8 @@
 # CleanNav Mission Manager M0 状态机设计
 
-> **状态：** M0-3 状态机冻结候选（修订版）。
-> **边界：** 本文冻结 Command Record、Execution Record、Manager Mode、内部执行状态、外部 TaskStatus 状态、事件、队列、超时与不变量；尚未创建业务代码或 Mock Adapter。
-> **后续依赖：** 精确 `reason_code` 数值和故障处置映射由 `mission_manager_reason_codes.md` 冻结。
+> **状态：** M0-3 状态机冻结候选（M0 总审查回填版）。
+> **边界：** 本文冻结 Command Record、Execution Record、Manager Mode、内部执行状态、外部 TaskStatus 状态、事件、FIFO 队列、超时与不变量；M1 业务代码和 Mock Adapter 尚未创建。
+> **配套基线：** 精确 `reason_code`、failure_disposition 与默认处置映射已由 `mission_manager_reason_codes.md` 冻结；接口字段已回填至 `mission_manager_interface.md` 和 v1.0 `cleannav_interfaces`。
 
 ---
 
@@ -921,7 +921,7 @@ Terminal 状态首次生成时发布一次；后续相同 command_id 的幂等�
 10. ESTOP 优先于所有普通事件；
 11. EMERGENCY_LATCHED 只允许 RESET_ESTOP 和重复 ESTOP；
 12. ESTOP 解除后不恢复旧任务或队列；
-13. STOP、RETURN_HOME、ESTOP 清空普通队列；
+13. STOP 和 ESTOP 清空普通队列；RETURN_HOME 只有在 home_pose 校验成功后才清空普通队列；
 14. RETURN_HOME 必须先校验 home_pose，再破坏当前任务或队列；
 15. PAUSE 保留普通队列；
 16. Mission Manager 不周期性重发 Goal；
@@ -934,48 +934,53 @@ Terminal 状态首次生成时发布一次；后续相同 command_id 的幂等�
 
 ---
 
-## 25. 需要回填接口文档的事项
+## 25. 已完成的接口回填事项
 
-后续回填 `docs/mission_manager_interface.md`：
+以下状态机结论已经回填到 `docs/mission_manager_interface.md`，并进入 v1.0 `cleannav_interfaces` 候选实现：
 
-1. TaskStatus 增加 `status_scope`；
+1. TaskStatus 已增加 `status_scope`；
 2. TaskStatus.state 使用本文 0～16 枚举；
-3. `progress` 不可用值=-1.0；
-4. `remaining_distance_m` 不可用值=-1.0；
-5. SCOPE_COMMAND 与 SCOPE_EXECUTION 字段语义；
-6. command terminal cache 与幂等重放；
-7. queued command 过期对外使用 STATE_CANCELED；
+3. `progress` 不可用值为 -1.0；
+4. `remaining_distance_m` 不可用值为 -1.0；
+5. SCOPE_COMMAND 与 SCOPE_EXECUTION 的 command_id/execution_id 语义已经冻结；
+6. terminal status cache 与 command_id 幂等重放规则已经冻结；
+7. queued command 激活前过期对外使用 SCOPE_COMMAND + STATE_CANCELED；
 8. Command Record APPLIED/TERMINAL 成功对外使用 STATE_SUCCEEDED；
-9. `navigation_active` 在 cleanup pending 期间仍应保持 true，直到导航确认结束；
-10. operational watchdog 使用 monotonic，可注入时钟。
+9. `navigation_active` 在 cleanup pending 期间保持 true，直到导航确认结束；
+10. operational watchdog 使用可注入 monotonic 时钟，语义时间使用 ROS Clock。
 
-本阶段不直接修改接口文档。
+上述事项不再属于“待回填”；后续修改必须同时审查状态机、接口文档、消息实现和测试计划。
 
 ---
 
 ## 26. 当前未决项
 
-| 项目 | 状态 |
+以下事项不阻塞 M0 状态机冻结，但必须在对应后续阶段明确：
+
+| 项目 | 状态 / 决策时点 |
 |---|---|
-| 精确 reason_code 数值 | 留给 Reason Code 文档 |
-| timeout 默认值 | 参数，待测试计划冻结候选 |
-| failure_disposition 与 reason_code 映射 | 留给 Reason Code 文档 |
+| timeout 默认值 | M1 参数实现与 FakeClock 测试前冻结候选 |
 | 真实 Adapter 如何获得 accepted/cancel/result | 等待 A* 与 Path Bridge 修复 |
-| Lease release 失败是否自动触发软件 ESTOP | 待安全策略冻结 |
-| 视觉目标显著偏移阈值 | 未决 |
-| 自动重选视觉目标策略 | M1 默认关闭 |
-| RESET_ESTOP 的真实 Safety 确认来源 | 当前 String 状态不足，待结构化 Adapter |
-| ESTOP 后 cleanup 失败的人工恢复流程 | 待安全运维策略 |
-| RETURN_HOME 在 Safety 暂不可用时是拒绝还是建立 HOLD 任务 | 待 Reason Code/产品策略 |
+| Lease release 失败是否自动触发软件 ESTOP | 真实 Safety Adapter/安全策略冻结 |
+| 视觉目标显著偏移阈值 | M1/感知联合验证后决定 |
+| 自动重选视觉目标策略 | M1 默认关闭，后续单独配置 |
+| RESET_ESTOP 的真实 Safety 确认来源 | 当前 String 状态不足，真实 Safety Adapter 前确定 |
+| ESTOP 后 cleanup 失败的人工恢复流程 | 安全运维策略阶段确定 |
+| RETURN_HOME 在 Safety 暂不可用时是拒绝还是建立 HOLD 任务 | 产品策略/真实 Safety Adapter 前决定 |
+
+已解决并移出未决项：
+
+- 精确 `reason_code` 数值：由 `mission_manager_reason_codes.md` 冻结；
+- `failure_disposition` 与 reason_code 映射：由 `mission_manager_reason_codes.md` 冻结；
+- queued command 过期的外部状态：已冻结为 SCOPE_COMMAND + STATE_CANCELED。
 
 ---
 
 ## 27. 后续顺序
 
-1. 审查并冻结本状态机文档；
-2. 创建 `mission_manager_reason_codes.md`；
-3. 回填 `mission_manager_interface.md`；
-4. 创建 `mission_manager_test_plan.md`；
-5. 修订 `cleannav_interfaces` 候选包；
-6. M0 总审查；
-7. M1 Mock 包骨架。
+1. 用本 M0 总审查回填版替换旧状态机文档；
+2. 与 `mission_manager_interface.md` 的 M0 总审查回填版一起执行最终跨文档检查；
+3. 修订并重新生成 `mission_manager_m0_total_audit.md`；
+4. 更新 `PROJECT_STATUS.md` 并提交 M0 最终冻结基线；
+5. 进入 M1 Mock 包骨架，先实现纯领域状态机、FakeClock、Mock Navigation Adapter 和 Mock Safety Lease Adapter；
+6. 在 A* / Path Bridge 连续导航问题修复前，不接真实 Navigation Adapter。
