@@ -32,8 +32,10 @@ class CommandReason(IntEnum):
     """M0-frozen reason codes used by command processing."""
 
     NONE = 0
+    COMMAND_RECEIVED = 1
     COMMAND_VALID = 2
     COMMAND_QUEUED = 3
+    IDEMPOTENT_REPLAY = 5
     QUEUED_COMMAND_EXPIRED = 29
 
     INTERFACE_VERSION_UNSUPPORTED = 100
@@ -57,6 +59,10 @@ class CommandReason(IntEnum):
     TASK_CATALOG_INVALID = 202
 
     TIMESTAMP_INVALID = 609
+
+    TERMINAL_STATE_ALREADY_WRITTEN = 710
+    TERMINAL_CACHE_MISSING = 711
+    COMMAND_RECORD_CORRUPT = 712
 
 
 @dataclass(frozen=True)

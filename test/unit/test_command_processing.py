@@ -74,10 +74,14 @@ def _validator(**kwargs):
 
 def test_reason_codes_match_generated_task_status():
     pairs = {
+        CommandReason.COMMAND_RECEIVED:
+            TaskStatus.REASON_COMMAND_RECEIVED,
         CommandReason.COMMAND_VALID:
             TaskStatus.REASON_COMMAND_VALID,
         CommandReason.COMMAND_QUEUED:
             TaskStatus.REASON_COMMAND_QUEUED,
+        CommandReason.IDEMPOTENT_REPLAY:
+            TaskStatus.REASON_IDEMPOTENT_REPLAY,
         CommandReason.QUEUED_COMMAND_EXPIRED:
             TaskStatus.REASON_QUEUED_COMMAND_EXPIRED,
         CommandReason.INTERFACE_VERSION_UNSUPPORTED:
@@ -116,6 +120,12 @@ def test_reason_codes_match_generated_task_status():
             TaskStatus.REASON_TASK_CATALOG_INVALID,
         CommandReason.TIMESTAMP_INVALID:
             TaskStatus.REASON_TIMESTAMP_INVALID,
+        CommandReason.TERMINAL_STATE_ALREADY_WRITTEN:
+            TaskStatus.REASON_TERMINAL_STATE_ALREADY_WRITTEN,
+        CommandReason.TERMINAL_CACHE_MISSING:
+            TaskStatus.REASON_TERMINAL_CACHE_MISSING,
+        CommandReason.COMMAND_RECORD_CORRUPT:
+            TaskStatus.REASON_COMMAND_RECORD_CORRUPT,
     }
 
     for domain_reason, ros_reason in pairs.items():
