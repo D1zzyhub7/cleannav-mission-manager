@@ -76,6 +76,10 @@ def test_reason_codes_match_generated_task_status():
     pairs = {
         CommandReason.COMMAND_VALID:
             TaskStatus.REASON_COMMAND_VALID,
+        CommandReason.COMMAND_QUEUED:
+            TaskStatus.REASON_COMMAND_QUEUED,
+        CommandReason.QUEUED_COMMAND_EXPIRED:
+            TaskStatus.REASON_QUEUED_COMMAND_EXPIRED,
         CommandReason.INTERFACE_VERSION_UNSUPPORTED:
             TaskStatus.REASON_INTERFACE_VERSION_UNSUPPORTED,
         CommandReason.COMMAND_ID_MISSING:
