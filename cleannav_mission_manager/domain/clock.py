@@ -21,7 +21,8 @@ def _validate_non_negative_finite(value: float, name: str) -> float:
 
 @dataclass
 class FakeClock:
-    """Deterministic clock for Mission Manager unit tests.
+    """
+    Deterministic clock for Mission Manager unit tests.
 
     ROS semantic time and monotonic watchdog time are intentionally
     independent.
@@ -64,7 +65,8 @@ class FakeClock:
         self._monotonic_time_s += seconds
 
     def set_ros(self, seconds: float) -> None:
-        """Set ROS semantic time explicitly.
+        """
+        Set ROS semantic time explicitly.
 
         Moving ROS time backwards is intentionally allowed for deterministic
         simulation/reset tests.

@@ -105,7 +105,8 @@ def _validate_ros_time(value: float) -> float:
 
 @dataclass
 class CommandRecord:
-    """Internal record keyed by command_id.
+    """
+    Internal record keyed by command_id.
 
     This record intentionally contains only M0-frozen identity and lifecycle
     data. Deduplication fingerprints and terminal-cache policy belong to later

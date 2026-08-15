@@ -108,6 +108,8 @@ def test_reason_codes_match_generated_task_status():
             TaskStatus.REASON_COMMAND_TOO_LARGE,
         CommandReason.TASK_CATALOG_UNAVAILABLE:
             TaskStatus.REASON_TASK_CATALOG_UNAVAILABLE,
+        CommandReason.TASK_CATALOG_INVALID:
+            TaskStatus.REASON_TASK_CATALOG_INVALID,
         CommandReason.TIMESTAMP_INVALID:
             TaskStatus.REASON_TIMESTAMP_INVALID,
     }

@@ -51,13 +51,15 @@ class CommandReason(IntEnum):
     COMMAND_TOO_LARGE = 124
 
     TASK_CATALOG_UNAVAILABLE = 201
+    TASK_CATALOG_INVALID = 202
 
     TIMESTAMP_INVALID = 609
 
 
 @dataclass(frozen=True)
 class NormalizedTaskCommand:
-    """ROS-independent representation of one TaskCommand.
+    """
+    ROS-independent representation of one TaskCommand.
 
     Times are integer nanoseconds so command expiry and deduplication do not
     depend on floating-point equality.
@@ -123,7 +125,8 @@ class DedupResult:
 def semantic_fingerprint(
     command: NormalizedTaskCommand,
 ) -> CommandSemanticFingerprint:
-    """Build the M0-frozen command semantic fingerprint.
+    """
+    Build the M0-frozen command semantic fingerprint.
 
     header.stamp, confidence and raw_text are intentionally excluded.
     """
@@ -136,7 +139,8 @@ def semantic_fingerprint(
 
 
 class CommandValidator:
-    """Validate normalized public TaskCommand data.
+    """
+    Validate normalized public TaskCommand data.
 
     Validation here covers only the frozen command/interface/catalog contract.
     Manager mode/state and confirmation safety checks belong to the state
@@ -181,11 +185,11 @@ class CommandValidator:
         *,
         now_ros_ns: int,
     ) -> ValidationResult:
-        """Validate one command.
+        """
+        Validate one command.
 
         The first failing check determines the returned reason code.
         """
-
         if type(now_ros_ns) is not int or now_ros_ns < 0:
             raise ValueError(
                 'now_ros_ns must be a non-negative int'
@@ -318,7 +322,8 @@ class CommandValidator:
 
 
 class CommandDeduplicator:
-    """Track command_id semantic fingerprints.
+    """
+    Track command_id semantic fingerprints.
 
     This component deliberately does not cache TaskStatus yet. A later
     terminal/current-status cache will provide the payload used for REPLAY.
