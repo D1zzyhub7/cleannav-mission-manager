@@ -1,0 +1,19 @@
+# ROS / colcon
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# Editor / OS
+.vscode/
+.DS_Store
+*~

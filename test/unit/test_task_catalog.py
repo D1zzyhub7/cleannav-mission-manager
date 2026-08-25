@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+from ament_index_python.packages import get_package_share_directory
 import pytest
 import yaml
 
@@ -20,8 +21,7 @@ from cleannav_mission_manager.domain.task_catalog import (
 
 
 REAL_CATALOG = (
-    Path(__file__).resolve().parents[3]
-    / 'cleannav_interfaces'
+    Path(get_package_share_directory('cleannav_interfaces'))
     / 'config'
     / 'task_catalog.yaml'
 )
