@@ -41,6 +41,7 @@ def test_internal_execution_states_match_frozen_contract():
         'LEASE_ACQUIRING',
         'EXECUTING',
         'CANCELING',
+        'FINALIZING',
         'PAUSED',
         'SAFETY_BLOCKED',
     ]
