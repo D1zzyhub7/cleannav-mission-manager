@@ -5,7 +5,10 @@ import inspect
 
 import pytest
 
-from cleannav_mission_manager.domain.models import InternalExecutionState
+from cleannav_mission_manager.domain.models import (
+    CancelIntent,
+    InternalExecutionState,
+)
 from cleannav_mission_manager.domain.state_machine import (
     CleanupContext,
     PendingOutcome,
@@ -21,6 +24,13 @@ def _context(state):
 
 
 def _executing_context():
+    return transition(
+        _lease_acquiring_context(),
+        StateMachineEvent.LEASE_ACQUIRED,
+    ).next_context
+
+
+def _lease_acquiring_context():
     context = _context(InternalExecutionState.PREPARING_GOAL)
     context = transition(
         context,
@@ -30,10 +40,24 @@ def _executing_context():
         context,
         StateMachineEvent.NAV_GOAL_ACCEPTED,
     ).next_context
-    return transition(
-        context,
-        StateMachineEvent.LEASE_ACQUIRED,
-    ).next_context
+    return context
+
+
+def _canceling_context(
+    outcome=PendingOutcome.CANCELED,
+    intent=CancelIntent.STOP,
+):
+    return StateMachineContext(
+        state=InternalExecutionState.CANCELING,
+        cancel_intent=intent,
+        pending_outcome=outcome,
+        cleanup=CleanupContext(
+            navigation_submitted=True,
+            navigation_cancel_required=True,
+            lease_was_active=True,
+            lease_release_required=True,
+        ),
+    )
 
 
 def test_finalizing_state_is_part_of_internal_execution_state():
@@ -87,19 +111,24 @@ def test_navigation_goal_accepted_acquires_lease():
         decision.next_context.state
         is InternalExecutionState.LEASE_ACQUIRING
     )
+    assert decision.next_context.cleanup.lease_acquire_pending is True
     assert decision.effects == (TransitionEffect.ACQUIRE_LEASE,)
 
 
 def test_lease_acquired_enters_executing():
     context = StateMachineContext(
         state=InternalExecutionState.LEASE_ACQUIRING,
-        cleanup=CleanupContext(navigation_submitted=True),
+        cleanup=CleanupContext(
+            navigation_submitted=True,
+            lease_acquire_pending=True,
+        ),
     )
 
     decision = transition(context, StateMachineEvent.LEASE_ACQUIRED)
 
     assert decision.accepted is True
     assert decision.next_context.state is InternalExecutionState.EXECUTING
+    assert decision.next_context.cleanup.lease_acquire_pending is False
     assert decision.next_context.cleanup.lease_was_active is True
     assert decision.effects == ()
 
@@ -174,10 +203,13 @@ def test_navigation_goal_rejected_fails_without_acquiring_lease():
     assert decision.effects == (TransitionEffect.TERMINAL_FAILED,)
 
 
-def test_lease_acquire_failed_is_deferred_without_partial_cleanup():
+def test_lease_acquire_failed_cancels_navigation_for_safety_block():
     context = StateMachineContext(
         state=InternalExecutionState.LEASE_ACQUIRING,
-        cleanup=CleanupContext(navigation_submitted=True),
+        cleanup=CleanupContext(
+            navigation_submitted=True,
+            lease_acquire_pending=True,
+        ),
     )
 
     decision = transition(
@@ -185,9 +217,18 @@ def test_lease_acquire_failed_is_deferred_without_partial_cleanup():
         StateMachineEvent.LEASE_ACQUIRE_FAILED,
     )
 
-    assert decision.accepted is False
-    assert decision.next_context is context
-    assert decision.effects == ()
+    assert decision.accepted is True
+    assert decision.next_context.state is InternalExecutionState.CANCELING
+    assert decision.next_context.cancel_intent is CancelIntent.SAFETY_BLOCK
+    assert (
+        decision.next_context.pending_outcome
+        is PendingOutcome.SAFETY_BLOCKED
+    )
+    assert decision.next_context.cleanup.navigation_cancel_required is True
+    assert decision.next_context.cleanup.lease_acquire_pending is False
+    assert decision.next_context.cleanup.lease_was_active is False
+    assert decision.next_context.cleanup.lease_release_required is False
+    assert decision.effects == (TransitionEffect.CANCEL_NAVIGATION,)
 
 
 def test_lease_release_failed_enters_safety_blocked():
@@ -212,6 +253,462 @@ def test_lease_release_failed_enters_safety_blocked():
     )
     assert decision.next_context.pending_outcome is PendingOutcome.SUCCEEDED
     assert decision.next_context.cleanup.cleanup_failed is True
+    assert decision.effects == ()
+
+
+@pytest.mark.parametrize(
+    'state',
+    [
+        InternalExecutionState.WAITING_TARGET,
+        InternalExecutionState.PREPARING_GOAL,
+    ],
+)
+def test_pause_without_resources_enters_clean_paused(state):
+    context = StateMachineContext(
+        state=state,
+        pending_outcome=PendingOutcome.FAILED,
+        cleanup=CleanupContext(cleanup_failed=True),
+    )
+
+    decision = transition(context, StateMachineEvent.PAUSE_REQUESTED)
+
+    assert decision.accepted is True
+    assert decision.next_context == _context(InternalExecutionState.PAUSED)
+    assert decision.effects == ()
+
+
+def test_pause_navigation_starting_requests_only_navigation_cancel():
+    context = StateMachineContext(
+        state=InternalExecutionState.NAVIGATION_STARTING,
+        cleanup=CleanupContext(navigation_submitted=True),
+    )
+
+    decision = transition(context, StateMachineEvent.PAUSE_REQUESTED)
+
+    assert decision.next_context.state is InternalExecutionState.CANCELING
+    assert decision.next_context.cancel_intent is CancelIntent.PAUSE
+    assert decision.next_context.pending_outcome is PendingOutcome.PAUSED
+    assert decision.next_context.cleanup.navigation_cancel_required is True
+    assert decision.next_context.cleanup.lease_release_required is False
+    assert decision.effects == (TransitionEffect.CANCEL_NAVIGATION,)
+
+
+def test_pause_executing_requests_cancel_and_release():
+    decision = transition(
+        _executing_context(),
+        StateMachineEvent.PAUSE_REQUESTED,
+    )
+
+    assert decision.next_context.state is InternalExecutionState.CANCELING
+    assert decision.next_context.cancel_intent is CancelIntent.PAUSE
+    assert decision.next_context.pending_outcome is PendingOutcome.PAUSED
+    assert decision.effects == (
+        TransitionEffect.CANCEL_NAVIGATION,
+        TransitionEffect.RELEASE_LEASE,
+    )
+
+
+def test_pause_cleanup_confirmation_enters_clean_paused():
+    context = transition(
+        StateMachineContext(
+            state=InternalExecutionState.NAVIGATION_STARTING,
+            cleanup=CleanupContext(navigation_submitted=True),
+        ),
+        StateMachineEvent.PAUSE_REQUESTED,
+    ).next_context
+
+    decision = transition(context, StateMachineEvent.NAV_CANCEL_CONFIRMED)
+
+    assert decision.next_context == _context(InternalExecutionState.PAUSED)
+    assert decision.effects == ()
+
+
+def test_duplicate_pause_in_paused_is_accepted_no_op():
+    context = _context(InternalExecutionState.PAUSED)
+
+    decision = transition(context, StateMachineEvent.PAUSE_REQUESTED)
+
+    assert decision.accepted is True
+    assert decision.next_context is context
+    assert decision.effects == ()
+
+
+def test_pause_in_dirty_safety_blocked_is_accepted_no_op():
+    context = StateMachineContext(
+        state=InternalExecutionState.SAFETY_BLOCKED,
+        cancel_intent=CancelIntent.SAFETY_BLOCK,
+        pending_outcome=PendingOutcome.SAFETY_BLOCKED,
+        cleanup=CleanupContext(cleanup_failed=True),
+    )
+
+    decision = transition(context, StateMachineEvent.PAUSE_REQUESTED)
+
+    assert decision.accepted is True
+    assert decision.next_context is context
+    assert decision.effects == ()
+
+
+def test_stop_from_paused_terminalizes_canceled_execution():
+    decision = transition(
+        _context(InternalExecutionState.PAUSED),
+        StateMachineEvent.STOP_REQUESTED,
+    )
+
+    assert decision.next_context == _context(InternalExecutionState.IDLE)
+    assert decision.effects == (TransitionEffect.TERMINAL_CANCELED,)
+
+
+def test_stop_active_execution_enters_canceling():
+    decision = transition(
+        _executing_context(),
+        StateMachineEvent.STOP_REQUESTED,
+    )
+
+    assert decision.next_context.state is InternalExecutionState.CANCELING
+    assert decision.next_context.cancel_intent is CancelIntent.STOP
+    assert decision.next_context.pending_outcome is PendingOutcome.CANCELED
+    assert decision.effects == (
+        TransitionEffect.CANCEL_NAVIGATION,
+        TransitionEffect.RELEASE_LEASE,
+    )
+
+
+def test_stop_cleanup_requires_both_confirmations():
+    context = _canceling_context()
+
+    cancel_only = transition(
+        context,
+        StateMachineEvent.NAV_CANCEL_CONFIRMED,
+    )
+    release_only = transition(
+        context,
+        StateMachineEvent.LEASE_RELEASED,
+    )
+
+    assert cancel_only.next_context.state is InternalExecutionState.CANCELING
+    assert release_only.next_context.state is InternalExecutionState.CANCELING
+    assert cancel_only.effects == ()
+    assert release_only.effects == ()
+
+
+def test_stop_cleanup_enters_clean_idle_and_terminalizes():
+    context = transition(
+        _canceling_context(),
+        StateMachineEvent.NAV_CANCEL_CONFIRMED,
+    ).next_context
+
+    decision = transition(context, StateMachineEvent.LEASE_RELEASED)
+
+    assert decision.next_context == _context(InternalExecutionState.IDLE)
+    assert decision.effects == (TransitionEffect.TERMINAL_CANCELED,)
+
+
+def test_stop_while_finalizing_does_not_repeat_release():
+    cleanup = CleanupContext(
+        navigation_submitted=True,
+        lease_was_active=True,
+        lease_release_required=True,
+    )
+    context = StateMachineContext(
+        state=InternalExecutionState.FINALIZING,
+        pending_outcome=PendingOutcome.SUCCEEDED,
+        cleanup=cleanup,
+    )
+
+    decision = transition(context, StateMachineEvent.STOP_REQUESTED)
+
+    assert decision.next_context.state is InternalExecutionState.CANCELING
+    assert decision.next_context.cancel_intent is CancelIntent.STOP
+    assert decision.next_context.pending_outcome is PendingOutcome.CANCELED
+    assert decision.next_context.cleanup is cleanup
+    assert decision.effects == ()
+
+
+@pytest.mark.parametrize(
+    'state',
+    [
+        InternalExecutionState.PAUSED,
+        InternalExecutionState.SAFETY_BLOCKED,
+    ],
+)
+def test_resume_advances_generation_before_goal_preparation(state):
+    context = _context(state)
+
+    decision = transition(context, StateMachineEvent.RESUME_ALLOWED)
+
+    assert decision.next_context == _context(
+        InternalExecutionState.PREPARING_GOAL
+    )
+    assert decision.effects == (TransitionEffect.ADVANCE_GENERATION,)
+    assert TransitionEffect.SUBMIT_NAVIGATION not in decision.effects
+
+
+@pytest.mark.parametrize(
+    'event',
+    [
+        StateMachineEvent.RESUME_ALLOWED,
+        StateMachineEvent.STOP_REQUESTED,
+        StateMachineEvent.RETURN_HOME_ALLOWED,
+    ],
+)
+def test_dirty_safety_blocked_rejects_control_exit(event):
+    context = StateMachineContext(
+        state=InternalExecutionState.SAFETY_BLOCKED,
+        cancel_intent=CancelIntent.SAFETY_BLOCK,
+        pending_outcome=PendingOutcome.SAFETY_BLOCKED,
+        cleanup=CleanupContext(
+            navigation_submitted=True,
+            navigation_cancel_required=True,
+        ),
+    )
+
+    decision = transition(context, event)
+
+    assert decision.accepted is False
+    assert decision.next_context is context
+    assert decision.effects == ()
+
+
+def test_return_home_without_resources_terminalizes_old_execution():
+    decision = transition(
+        _context(InternalExecutionState.PAUSED),
+        StateMachineEvent.RETURN_HOME_ALLOWED,
+    )
+
+    assert decision.next_context == _context(InternalExecutionState.IDLE)
+    assert decision.effects == (
+        TransitionEffect.TERMINAL_CANCELED,
+        TransitionEffect.START_RETURN_HOME,
+    )
+
+
+def test_return_home_with_active_resources_enters_canceling():
+    decision = transition(
+        _executing_context(),
+        StateMachineEvent.RETURN_HOME_ALLOWED,
+    )
+
+    assert decision.next_context.state is InternalExecutionState.CANCELING
+    assert decision.next_context.cancel_intent is CancelIntent.RETURN_HOME
+    assert (
+        decision.next_context.pending_outcome
+        is PendingOutcome.START_RETURN_HOME
+    )
+    assert decision.effects == (
+        TransitionEffect.CANCEL_NAVIGATION,
+        TransitionEffect.RELEASE_LEASE,
+    )
+
+
+def test_return_home_cleanup_returns_clean_old_context_and_both_effects():
+    context = _canceling_context(
+        PendingOutcome.START_RETURN_HOME,
+        CancelIntent.RETURN_HOME,
+    )
+    context = transition(
+        context,
+        StateMachineEvent.NAV_CANCEL_CONFIRMED,
+    ).next_context
+
+    decision = transition(context, StateMachineEvent.LEASE_RELEASED)
+
+    assert decision.next_context == _context(InternalExecutionState.IDLE)
+    assert decision.effects == (
+        TransitionEffect.TERMINAL_CANCELED,
+        TransitionEffect.START_RETURN_HOME,
+    )
+
+
+def test_safety_block_active_execution_enters_canceling():
+    decision = transition(
+        _executing_context(),
+        StateMachineEvent.SAFETY_BLOCK_REQUESTED,
+    )
+
+    assert decision.next_context.state is InternalExecutionState.CANCELING
+    assert decision.next_context.cancel_intent is CancelIntent.SAFETY_BLOCK
+    assert (
+        decision.next_context.pending_outcome
+        is PendingOutcome.SAFETY_BLOCKED
+    )
+    assert decision.effects == (
+        TransitionEffect.CANCEL_NAVIGATION,
+        TransitionEffect.RELEASE_LEASE,
+    )
+
+
+def test_safety_block_cleanup_enters_clean_blocked_without_terminal():
+    context = _canceling_context(
+        PendingOutcome.SAFETY_BLOCKED,
+        CancelIntent.SAFETY_BLOCK,
+    )
+    context = transition(
+        context,
+        StateMachineEvent.NAV_CANCEL_CONFIRMED,
+    ).next_context
+
+    decision = transition(context, StateMachineEvent.LEASE_RELEASED)
+
+    assert decision.next_context == _context(
+        InternalExecutionState.SAFETY_BLOCKED
+    )
+    assert decision.effects == ()
+
+
+@pytest.mark.parametrize(
+    ('event', 'required_flag'),
+    [
+        (StateMachineEvent.NAV_CANCEL_FAILED, 'navigation_cancel_required'),
+        (StateMachineEvent.LEASE_RELEASE_FAILED, 'lease_release_required'),
+    ],
+)
+def test_canceling_cleanup_failure_enters_safety_blocked(
+    event,
+    required_flag,
+):
+    context = _canceling_context()
+
+    decision = transition(context, event)
+
+    assert decision.accepted is True
+    assert (
+        decision.next_context.state
+        is InternalExecutionState.SAFETY_BLOCKED
+    )
+    assert decision.next_context.pending_outcome is PendingOutcome.CANCELED
+    assert getattr(decision.next_context.cleanup, required_flag) is True
+    assert decision.next_context.cleanup.cleanup_failed is True
+    assert decision.effects == ()
+
+
+def test_late_lease_acquired_while_canceling_requests_release_only():
+    context = StateMachineContext(
+        state=InternalExecutionState.CANCELING,
+        cancel_intent=CancelIntent.PAUSE,
+        pending_outcome=PendingOutcome.PAUSED,
+        cleanup=CleanupContext(
+            navigation_submitted=True,
+            navigation_cancel_required=True,
+            lease_acquire_pending=True,
+        ),
+    )
+
+    decision = transition(context, StateMachineEvent.LEASE_ACQUIRED)
+
+    assert decision.next_context.state is InternalExecutionState.CANCELING
+    assert decision.next_context.cleanup.lease_acquire_pending is False
+    assert decision.next_context.cleanup.lease_was_active is True
+    assert decision.next_context.cleanup.lease_release_required is True
+    assert decision.effects == (TransitionEffect.RELEASE_LEASE,)
+
+
+def test_canceling_waits_after_cancel_confirmed_while_acquire_pending():
+    context = transition(
+        _lease_acquiring_context(),
+        StateMachineEvent.PAUSE_REQUESTED,
+    ).next_context
+
+    decision = transition(
+        context,
+        StateMachineEvent.NAV_CANCEL_CONFIRMED,
+    )
+
+    assert decision.next_context.state is InternalExecutionState.CANCELING
+    assert decision.next_context.cleanup.navigation_cancel_confirmed is True
+    assert decision.next_context.cleanup.lease_acquire_pending is True
+    assert decision.effects == ()
+
+
+def test_late_lease_acquired_requires_release_before_pause_completes():
+    context = transition(
+        _lease_acquiring_context(),
+        StateMachineEvent.PAUSE_REQUESTED,
+    ).next_context
+    context = transition(
+        context,
+        StateMachineEvent.NAV_CANCEL_CONFIRMED,
+    ).next_context
+
+    acquired = transition(context, StateMachineEvent.LEASE_ACQUIRED)
+
+    assert acquired.next_context.state is InternalExecutionState.CANCELING
+    assert acquired.next_context.cleanup.lease_acquire_pending is False
+    assert acquired.next_context.cleanup.lease_was_active is True
+    assert acquired.next_context.cleanup.lease_release_required is True
+    assert acquired.effects == (TransitionEffect.RELEASE_LEASE,)
+
+    released = transition(
+        acquired.next_context,
+        StateMachineEvent.LEASE_RELEASED,
+    )
+    assert released.next_context == _context(InternalExecutionState.PAUSED)
+    assert released.effects == ()
+
+
+def test_late_lease_acquire_failure_completes_stop_after_cancel():
+    context = transition(
+        _lease_acquiring_context(),
+        StateMachineEvent.STOP_REQUESTED,
+    ).next_context
+    context = transition(
+        context,
+        StateMachineEvent.NAV_CANCEL_CONFIRMED,
+    ).next_context
+
+    decision = transition(
+        context,
+        StateMachineEvent.LEASE_ACQUIRE_FAILED,
+    )
+
+    assert decision.next_context == _context(InternalExecutionState.IDLE)
+    assert decision.effects == (TransitionEffect.TERMINAL_CANCELED,)
+
+
+@pytest.mark.parametrize(
+    ('control_event', 'expected_state', 'expected_effects'),
+    [
+        (
+            StateMachineEvent.PAUSE_REQUESTED,
+            InternalExecutionState.PAUSED,
+            (),
+        ),
+        (
+            StateMachineEvent.STOP_REQUESTED,
+            InternalExecutionState.IDLE,
+            (TransitionEffect.TERMINAL_CANCELED,),
+        ),
+    ],
+)
+def test_goal_rejected_while_canceling_completes_pending_outcome(
+    control_event,
+    expected_state,
+    expected_effects,
+):
+    context = StateMachineContext(
+        state=InternalExecutionState.NAVIGATION_STARTING,
+        cleanup=CleanupContext(navigation_submitted=True),
+    )
+    context = transition(context, control_event).next_context
+
+    decision = transition(context, StateMachineEvent.NAV_GOAL_REJECTED)
+
+    assert decision.next_context == _context(expected_state)
+    assert decision.effects == expected_effects
+
+
+def test_start_replan_cleanup_remains_deferred():
+    context = _canceling_context(
+        PendingOutcome.START_REPLAN,
+        CancelIntent.REPLAN,
+    )
+
+    decision = transition(
+        context,
+        StateMachineEvent.NAV_CANCEL_CONFIRMED,
+    )
+
+    assert decision.accepted is False
+    assert decision.next_context is context
     assert decision.effects == ()
 
 

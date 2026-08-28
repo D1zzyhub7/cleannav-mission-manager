@@ -33,6 +33,7 @@ class CleanupContext:
     navigation_submitted: bool = False
     navigation_cancel_required: bool = False
     navigation_cancel_confirmed: bool = False
+    lease_acquire_pending: bool = False
     lease_was_active: bool = False
     lease_release_required: bool = False
     lease_release_confirmed: bool = False
@@ -50,7 +51,7 @@ class StateMachineContext:
 
 
 class StateMachineEvent(Enum):
-    """Normal-lifecycle events supported by the M1-2iA gate."""
+    """Execution lifecycle events supported by the pure state machine."""
 
     GOAL_PREPARED = 'GOAL_PREPARED'
     NAV_GOAL_ACCEPTED = 'NAV_GOAL_ACCEPTED'
@@ -61,6 +62,13 @@ class StateMachineEvent(Enum):
     NAV_FAILED = 'NAV_FAILED'
     LEASE_RELEASED = 'LEASE_RELEASED'
     LEASE_RELEASE_FAILED = 'LEASE_RELEASE_FAILED'
+    PAUSE_REQUESTED = 'PAUSE_REQUESTED'
+    STOP_REQUESTED = 'STOP_REQUESTED'
+    RESUME_ALLOWED = 'RESUME_ALLOWED'
+    RETURN_HOME_ALLOWED = 'RETURN_HOME_ALLOWED'
+    SAFETY_BLOCK_REQUESTED = 'SAFETY_BLOCK_REQUESTED'
+    NAV_CANCEL_CONFIRMED = 'NAV_CANCEL_CONFIRMED'
+    NAV_CANCEL_FAILED = 'NAV_CANCEL_FAILED'
 
 
 class TransitionEffect(Enum):
@@ -71,6 +79,10 @@ class TransitionEffect(Enum):
     RELEASE_LEASE = 'RELEASE_LEASE'
     TERMINAL_SUCCEEDED = 'TERMINAL_SUCCEEDED'
     TERMINAL_FAILED = 'TERMINAL_FAILED'
+    CANCEL_NAVIGATION = 'CANCEL_NAVIGATION'
+    ADVANCE_GENERATION = 'ADVANCE_GENERATION'
+    TERMINAL_CANCELED = 'TERMINAL_CANCELED'
+    START_RETURN_HOME = 'START_RETURN_HOME'
 
 
 @dataclass(frozen=True)
@@ -107,17 +119,383 @@ def _rejected(context: StateMachineContext) -> TransitionDecision:
     )
 
 
+def _cleanup_complete(cleanup: CleanupContext) -> bool:
+    """Return whether every required cleanup has been confirmed."""
+    return (
+        (
+            not cleanup.navigation_cancel_required
+            or cleanup.navigation_cancel_confirmed
+        )
+        and (
+            not cleanup.lease_release_required
+            or cleanup.lease_release_confirmed
+        )
+        and not cleanup.lease_acquire_pending
+        and not cleanup.cleanup_failed
+    )
+
+
+def _clean_context(state: InternalExecutionState) -> StateMachineContext:
+    """Build a state context without transient execution cleanup data."""
+    return StateMachineContext(state=state)
+
+
+def _is_clean_safety_blocked(context: StateMachineContext) -> bool:
+    """Return whether a safety-blocked execution has no pending cleanup."""
+    return (
+        context.state is InternalExecutionState.SAFETY_BLOCKED
+        and context.cancel_intent is None
+        and context.pending_outcome is PendingOutcome.NONE
+        and context.cleanup == CleanupContext()
+    )
+
+
+def _start_canceling(
+    context: StateMachineContext,
+    intent: CancelIntent,
+    outcome: PendingOutcome,
+) -> TransitionDecision:
+    """Enter cancellation and request cleanup for active resources."""
+    cleanup = context.cleanup
+    request_cancel = (
+        cleanup.navigation_submitted
+        and not cleanup.navigation_cancel_required
+    )
+    request_release = (
+        cleanup.lease_was_active
+        and not cleanup.lease_release_required
+    )
+    next_cleanup = replace(
+        cleanup,
+        navigation_cancel_required=(
+            cleanup.navigation_cancel_required
+            or cleanup.navigation_submitted
+        ),
+        lease_release_required=(
+            cleanup.lease_release_required
+            or cleanup.lease_was_active
+        ),
+    )
+    effects = []
+    if request_cancel:
+        effects.append(TransitionEffect.CANCEL_NAVIGATION)
+    if request_release:
+        effects.append(TransitionEffect.RELEASE_LEASE)
+
+    return _decision(
+        context,
+        replace(
+            context,
+            state=InternalExecutionState.CANCELING,
+            cancel_intent=intent,
+            pending_outcome=outcome,
+            cleanup=next_cleanup,
+        ),
+        *effects,
+    )
+
+
+def _finish_canceling(
+    previous: StateMachineContext,
+    next_context: StateMachineContext,
+) -> TransitionDecision:
+    """Finish a cancellation when all required cleanup is confirmed."""
+    if not _cleanup_complete(next_context.cleanup):
+        return _decision(previous, next_context)
+
+    outcome = next_context.pending_outcome
+    if outcome is PendingOutcome.PAUSED:
+        return _decision(
+            previous,
+            _clean_context(InternalExecutionState.PAUSED),
+        )
+    if outcome is PendingOutcome.CANCELED:
+        return _decision(
+            previous,
+            _clean_context(InternalExecutionState.IDLE),
+            TransitionEffect.TERMINAL_CANCELED,
+        )
+    if outcome is PendingOutcome.SAFETY_BLOCKED:
+        return _decision(
+            previous,
+            _clean_context(InternalExecutionState.SAFETY_BLOCKED),
+        )
+    if outcome is PendingOutcome.START_RETURN_HOME:
+        return _decision(
+            previous,
+            _clean_context(InternalExecutionState.IDLE),
+            TransitionEffect.TERMINAL_CANCELED,
+            TransitionEffect.START_RETURN_HOME,
+        )
+
+    return _rejected(previous)
+
+
 def transition(
     context: StateMachineContext,
     event: StateMachineEvent,
 ) -> TransitionDecision:
-    """Apply one M1-2iA event without mutating state or calling adapters."""
+    """Apply one domain event without mutating state or calling adapters."""
     if not isinstance(context, StateMachineContext):
         raise TypeError('context must be StateMachineContext')
     if not isinstance(event, StateMachineEvent):
         raise TypeError('event must be StateMachineEvent')
 
     state = context.state
+
+    if event is StateMachineEvent.PAUSE_REQUESTED:
+        if state in (
+            InternalExecutionState.WAITING_TARGET,
+            InternalExecutionState.PREPARING_GOAL,
+        ):
+            return _decision(
+                context,
+                _clean_context(InternalExecutionState.PAUSED),
+            )
+        if state is InternalExecutionState.PAUSED:
+            return _decision(context, context)
+        if state is InternalExecutionState.SAFETY_BLOCKED:
+            return _decision(context, context)
+        if state in (
+            InternalExecutionState.NAVIGATION_STARTING,
+            InternalExecutionState.LEASE_ACQUIRING,
+            InternalExecutionState.EXECUTING,
+        ):
+            return _start_canceling(
+                context,
+                CancelIntent.PAUSE,
+                PendingOutcome.PAUSED,
+            )
+        return _rejected(context)
+
+    if event is StateMachineEvent.STOP_REQUESTED:
+        if state in (
+            InternalExecutionState.WAITING_TARGET,
+            InternalExecutionState.PREPARING_GOAL,
+            InternalExecutionState.PAUSED,
+        ):
+            return _decision(
+                context,
+                _clean_context(InternalExecutionState.IDLE),
+                TransitionEffect.TERMINAL_CANCELED,
+            )
+        if state is InternalExecutionState.SAFETY_BLOCKED:
+            if not _is_clean_safety_blocked(context):
+                return _rejected(context)
+            return _decision(
+                context,
+                _clean_context(InternalExecutionState.IDLE),
+                TransitionEffect.TERMINAL_CANCELED,
+            )
+        if state in (
+            InternalExecutionState.NAVIGATION_STARTING,
+            InternalExecutionState.LEASE_ACQUIRING,
+            InternalExecutionState.EXECUTING,
+        ):
+            return _start_canceling(
+                context,
+                CancelIntent.STOP,
+                PendingOutcome.CANCELED,
+            )
+        if state is InternalExecutionState.FINALIZING:
+            return _decision(
+                context,
+                replace(
+                    context,
+                    state=InternalExecutionState.CANCELING,
+                    cancel_intent=CancelIntent.STOP,
+                    pending_outcome=PendingOutcome.CANCELED,
+                ),
+            )
+        return _rejected(context)
+
+    if event is StateMachineEvent.RETURN_HOME_ALLOWED:
+        if state in (
+            InternalExecutionState.WAITING_TARGET,
+            InternalExecutionState.PREPARING_GOAL,
+            InternalExecutionState.PAUSED,
+        ):
+            return _decision(
+                context,
+                _clean_context(InternalExecutionState.IDLE),
+                TransitionEffect.TERMINAL_CANCELED,
+                TransitionEffect.START_RETURN_HOME,
+            )
+        if state is InternalExecutionState.SAFETY_BLOCKED:
+            if not _is_clean_safety_blocked(context):
+                return _rejected(context)
+            return _decision(
+                context,
+                _clean_context(InternalExecutionState.IDLE),
+                TransitionEffect.TERMINAL_CANCELED,
+                TransitionEffect.START_RETURN_HOME,
+            )
+        if state in (
+            InternalExecutionState.NAVIGATION_STARTING,
+            InternalExecutionState.LEASE_ACQUIRING,
+            InternalExecutionState.EXECUTING,
+        ):
+            return _start_canceling(
+                context,
+                CancelIntent.RETURN_HOME,
+                PendingOutcome.START_RETURN_HOME,
+            )
+        if state is InternalExecutionState.FINALIZING:
+            return _decision(
+                context,
+                replace(
+                    context,
+                    state=InternalExecutionState.CANCELING,
+                    cancel_intent=CancelIntent.RETURN_HOME,
+                    pending_outcome=PendingOutcome.START_RETURN_HOME,
+                ),
+            )
+        return _rejected(context)
+
+    if event is StateMachineEvent.RESUME_ALLOWED:
+        if state is InternalExecutionState.PAUSED:
+            return _decision(
+                context,
+                _clean_context(InternalExecutionState.PREPARING_GOAL),
+                TransitionEffect.ADVANCE_GENERATION,
+            )
+        if state is InternalExecutionState.SAFETY_BLOCKED:
+            if not _is_clean_safety_blocked(context):
+                return _rejected(context)
+            return _decision(
+                context,
+                _clean_context(InternalExecutionState.PREPARING_GOAL),
+                TransitionEffect.ADVANCE_GENERATION,
+            )
+        return _rejected(context)
+
+    if event is StateMachineEvent.SAFETY_BLOCK_REQUESTED:
+        if state in (
+            InternalExecutionState.NAVIGATION_STARTING,
+            InternalExecutionState.LEASE_ACQUIRING,
+            InternalExecutionState.EXECUTING,
+        ):
+            return _start_canceling(
+                context,
+                CancelIntent.SAFETY_BLOCK,
+                PendingOutcome.SAFETY_BLOCKED,
+            )
+        if state in (
+            InternalExecutionState.WAITING_TARGET,
+            InternalExecutionState.PREPARING_GOAL,
+            InternalExecutionState.PAUSED,
+        ):
+            return _decision(
+                context,
+                _clean_context(InternalExecutionState.SAFETY_BLOCKED),
+            )
+        return _rejected(context)
+
+    if state is InternalExecutionState.CANCELING:
+        if event is StateMachineEvent.NAV_CANCEL_CONFIRMED:
+            if context.pending_outcome is PendingOutcome.START_REPLAN:
+                return _rejected(context)
+            if (
+                not context.cleanup.navigation_cancel_required
+                or context.cleanup.navigation_cancel_confirmed
+            ):
+                return _rejected(context)
+            cleanup = replace(
+                context.cleanup,
+                navigation_cancel_confirmed=True,
+            )
+            return _finish_canceling(
+                context,
+                replace(context, cleanup=cleanup),
+            )
+
+        if event is StateMachineEvent.NAV_GOAL_REJECTED:
+            if (
+                not context.cleanup.navigation_cancel_required
+                or context.cleanup.navigation_cancel_confirmed
+            ):
+                return _rejected(context)
+            cleanup = replace(
+                context.cleanup,
+                navigation_cancel_confirmed=True,
+            )
+            return _finish_canceling(
+                context,
+                replace(context, cleanup=cleanup),
+            )
+
+        if event is StateMachineEvent.LEASE_RELEASED:
+            if context.pending_outcome is PendingOutcome.START_REPLAN:
+                return _rejected(context)
+            if (
+                not context.cleanup.lease_release_required
+                or context.cleanup.lease_release_confirmed
+            ):
+                return _rejected(context)
+            cleanup = replace(
+                context.cleanup,
+                lease_release_confirmed=True,
+            )
+            return _finish_canceling(
+                context,
+                replace(context, cleanup=cleanup),
+            )
+
+        if event is StateMachineEvent.NAV_CANCEL_FAILED:
+            if not context.cleanup.navigation_cancel_required:
+                return _rejected(context)
+            cleanup = replace(context.cleanup, cleanup_failed=True)
+            return _decision(
+                context,
+                replace(
+                    context,
+                    state=InternalExecutionState.SAFETY_BLOCKED,
+                    cleanup=cleanup,
+                ),
+            )
+
+        if event is StateMachineEvent.LEASE_RELEASE_FAILED:
+            if not context.cleanup.lease_release_required:
+                return _rejected(context)
+            cleanup = replace(context.cleanup, cleanup_failed=True)
+            return _decision(
+                context,
+                replace(
+                    context,
+                    state=InternalExecutionState.SAFETY_BLOCKED,
+                    cleanup=cleanup,
+                ),
+            )
+
+        if event is StateMachineEvent.LEASE_ACQUIRED:
+            if not context.cleanup.lease_acquire_pending:
+                return _rejected(context)
+            cleanup = replace(
+                context.cleanup,
+                lease_acquire_pending=False,
+                lease_was_active=True,
+                lease_release_required=True,
+                lease_release_confirmed=False,
+            )
+            return _decision(
+                context,
+                replace(context, cleanup=cleanup),
+                TransitionEffect.RELEASE_LEASE,
+            )
+
+        if event is StateMachineEvent.LEASE_ACQUIRE_FAILED:
+            if not context.cleanup.lease_acquire_pending:
+                return _rejected(context)
+            cleanup = replace(
+                context.cleanup,
+                lease_acquire_pending=False,
+            )
+            return _finish_canceling(
+                context,
+                replace(context, cleanup=cleanup),
+            )
+
+        return _rejected(context)
 
     if (
         state is InternalExecutionState.PREPARING_GOAL
@@ -139,11 +517,16 @@ def transition(
 
     if state is InternalExecutionState.NAVIGATION_STARTING:
         if event is StateMachineEvent.NAV_GOAL_ACCEPTED:
+            cleanup = replace(
+                context.cleanup,
+                lease_acquire_pending=True,
+            )
             return _decision(
                 context,
                 replace(
                     context,
                     state=InternalExecutionState.LEASE_ACQUIRING,
+                    cleanup=cleanup,
                 ),
                 TransitionEffect.ACQUIRE_LEASE,
             )
@@ -162,20 +545,38 @@ def transition(
 
     if (
         state is InternalExecutionState.LEASE_ACQUIRING
-        and event is StateMachineEvent.LEASE_ACQUIRED
     ):
-        cleanup = replace(
-            context.cleanup,
-            lease_was_active=True,
-        )
-        return _decision(
-            context,
-            replace(
+        if event is StateMachineEvent.LEASE_ACQUIRED:
+            cleanup = replace(
+                context.cleanup,
+                lease_acquire_pending=False,
+                lease_was_active=True,
+            )
+            return _decision(
                 context,
-                state=InternalExecutionState.EXECUTING,
-                cleanup=cleanup,
-            ),
-        )
+                replace(
+                    context,
+                    state=InternalExecutionState.EXECUTING,
+                    cleanup=cleanup,
+                ),
+            )
+        if event is StateMachineEvent.LEASE_ACQUIRE_FAILED:
+            cleanup = CleanupContext(
+                navigation_submitted=True,
+                navigation_cancel_required=True,
+                lease_acquire_pending=False,
+            )
+            return _decision(
+                context,
+                replace(
+                    context,
+                    state=InternalExecutionState.CANCELING,
+                    cancel_intent=CancelIntent.SAFETY_BLOCK,
+                    pending_outcome=PendingOutcome.SAFETY_BLOCKED,
+                    cleanup=cleanup,
+                ),
+                TransitionEffect.CANCEL_NAVIGATION,
+            )
 
     if state is InternalExecutionState.EXECUTING:
         if event is StateMachineEvent.NAV_SUCCEEDED:
