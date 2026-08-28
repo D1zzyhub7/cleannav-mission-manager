@@ -9,6 +9,7 @@ from typing import Optional
 from cleannav_mission_manager.domain.models import (
     CancelIntent,
     InternalExecutionState,
+    ManagerMode,
 )
 
 
@@ -45,6 +46,7 @@ class StateMachineContext:
     """Immutable input and output context for the pure state machine."""
 
     state: InternalExecutionState
+    manager_mode: ManagerMode = ManagerMode.NORMAL
     cancel_intent: Optional[CancelIntent] = None
     pending_outcome: PendingOutcome = PendingOutcome.NONE
     cleanup: CleanupContext = CleanupContext()
@@ -69,6 +71,8 @@ class StateMachineEvent(Enum):
     SAFETY_BLOCK_REQUESTED = 'SAFETY_BLOCK_REQUESTED'
     NAV_CANCEL_CONFIRMED = 'NAV_CANCEL_CONFIRMED'
     NAV_CANCEL_FAILED = 'NAV_CANCEL_FAILED'
+    ESTOP_REQUESTED = 'ESTOP_REQUESTED'
+    RESET_ESTOP_ALLOWED = 'RESET_ESTOP_ALLOWED'
 
 
 class TransitionEffect(Enum):
@@ -83,6 +87,8 @@ class TransitionEffect(Enum):
     ADVANCE_GENERATION = 'ADVANCE_GENERATION'
     TERMINAL_CANCELED = 'TERMINAL_CANCELED'
     START_RETURN_HOME = 'START_RETURN_HOME'
+    REQUEST_SAFETY_ESTOP = 'REQUEST_SAFETY_ESTOP'
+    TERMINAL_EMERGENCY_STOPPED = 'TERMINAL_EMERGENCY_STOPPED'
 
 
 @dataclass(frozen=True)
@@ -135,9 +141,15 @@ def _cleanup_complete(cleanup: CleanupContext) -> bool:
     )
 
 
-def _clean_context(state: InternalExecutionState) -> StateMachineContext:
+def _clean_context(
+    state: InternalExecutionState,
+    manager_mode: ManagerMode = ManagerMode.NORMAL,
+) -> StateMachineContext:
     """Build a state context without transient execution cleanup data."""
-    return StateMachineContext(state=state)
+    return StateMachineContext(
+        state=state,
+        manager_mode=manager_mode,
+    )
 
 
 def _is_clean_safety_blocked(context: StateMachineContext) -> bool:
@@ -195,6 +207,60 @@ def _start_canceling(
     )
 
 
+def _start_emergency_canceling(
+    context: StateMachineContext,
+    request_navigation: bool = True,
+    request_lease: bool = True,
+) -> TransitionDecision:
+    """Latch emergency mode and preserve or request required cleanup."""
+    cleanup = context.cleanup
+    request_cancel = (
+        request_navigation
+        and cleanup.navigation_submitted
+        and not cleanup.navigation_cancel_required
+    )
+    request_release = (
+        request_lease
+        and cleanup.lease_was_active
+        and not cleanup.lease_release_required
+    )
+    next_cleanup = replace(
+        cleanup,
+        navigation_cancel_required=(
+            cleanup.navigation_cancel_required or request_cancel
+        ),
+        lease_release_required=(
+            cleanup.lease_release_required or request_release
+        ),
+    )
+    effects = [TransitionEffect.REQUEST_SAFETY_ESTOP]
+    if request_cancel:
+        effects.append(TransitionEffect.CANCEL_NAVIGATION)
+    if request_release:
+        effects.append(TransitionEffect.RELEASE_LEASE)
+
+    next_context = replace(
+        context,
+        state=InternalExecutionState.CANCELING,
+        manager_mode=ManagerMode.EMERGENCY_LATCHED,
+        cancel_intent=CancelIntent.ESTOP,
+        pending_outcome=PendingOutcome.EMERGENCY_STOPPED,
+        cleanup=next_cleanup,
+    )
+    if _cleanup_complete(next_cleanup):
+        return _decision(
+            context,
+            _clean_context(
+                InternalExecutionState.IDLE,
+                ManagerMode.EMERGENCY_LATCHED,
+            ),
+            *effects,
+            TransitionEffect.TERMINAL_EMERGENCY_STOPPED,
+        )
+
+    return _decision(context, next_context, *effects)
+
+
 def _finish_canceling(
     previous: StateMachineContext,
     next_context: StateMachineContext,
@@ -227,6 +293,15 @@ def _finish_canceling(
             TransitionEffect.TERMINAL_CANCELED,
             TransitionEffect.START_RETURN_HOME,
         )
+    if outcome is PendingOutcome.EMERGENCY_STOPPED:
+        return _decision(
+            previous,
+            _clean_context(
+                InternalExecutionState.IDLE,
+                ManagerMode.EMERGENCY_LATCHED,
+            ),
+            TransitionEffect.TERMINAL_EMERGENCY_STOPPED,
+        )
 
     return _rejected(previous)
 
@@ -242,6 +317,82 @@ def transition(
         raise TypeError('event must be StateMachineEvent')
 
     state = context.state
+
+    if event is StateMachineEvent.ESTOP_REQUESTED:
+        if context.manager_mode is ManagerMode.EMERGENCY_LATCHED:
+            return _decision(context, context)
+        if state is InternalExecutionState.IDLE:
+            return _decision(
+                context,
+                _clean_context(
+                    InternalExecutionState.IDLE,
+                    ManagerMode.EMERGENCY_LATCHED,
+                ),
+                TransitionEffect.REQUEST_SAFETY_ESTOP,
+            )
+        if state in (
+            InternalExecutionState.WAITING_TARGET,
+            InternalExecutionState.PREPARING_GOAL,
+            InternalExecutionState.PAUSED,
+        ) or (
+            state is InternalExecutionState.SAFETY_BLOCKED
+            and _is_clean_safety_blocked(context)
+        ):
+            return _decision(
+                context,
+                _clean_context(
+                    InternalExecutionState.IDLE,
+                    ManagerMode.EMERGENCY_LATCHED,
+                ),
+                TransitionEffect.REQUEST_SAFETY_ESTOP,
+                TransitionEffect.TERMINAL_EMERGENCY_STOPPED,
+            )
+        if state in (
+            InternalExecutionState.NAVIGATION_STARTING,
+            InternalExecutionState.LEASE_ACQUIRING,
+            InternalExecutionState.EXECUTING,
+            InternalExecutionState.CANCELING,
+        ):
+            return _start_emergency_canceling(context)
+        if state is InternalExecutionState.FINALIZING:
+            return _start_emergency_canceling(
+                context,
+                request_navigation=False,
+                request_lease=False,
+            )
+        if state is InternalExecutionState.SAFETY_BLOCKED:
+            return _start_emergency_canceling(context)
+        return _rejected(context)
+
+    if event is StateMachineEvent.RESET_ESTOP_ALLOWED:
+        if (
+            context.manager_mode is ManagerMode.EMERGENCY_LATCHED
+            and state is InternalExecutionState.IDLE
+            and context.cancel_intent is None
+            and context.pending_outcome is PendingOutcome.NONE
+            and context.cleanup == CleanupContext()
+        ):
+            return _decision(
+                context,
+                _clean_context(InternalExecutionState.IDLE),
+            )
+        return _rejected(context)
+
+    if context.manager_mode is ManagerMode.EMERGENCY_LATCHED:
+        emergency_cleanup_events = (
+            StateMachineEvent.NAV_CANCEL_CONFIRMED,
+            StateMachineEvent.NAV_GOAL_REJECTED,
+            StateMachineEvent.NAV_CANCEL_FAILED,
+            StateMachineEvent.LEASE_ACQUIRED,
+            StateMachineEvent.LEASE_ACQUIRE_FAILED,
+            StateMachineEvent.LEASE_RELEASED,
+            StateMachineEvent.LEASE_RELEASE_FAILED,
+        )
+        if not (
+            state is InternalExecutionState.CANCELING
+            and event in emergency_cleanup_events
+        ):
+            return _rejected(context)
 
     if event is StateMachineEvent.PAUSE_REQUESTED:
         if state in (
