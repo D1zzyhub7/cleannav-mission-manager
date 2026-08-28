@@ -257,3 +257,9 @@ RETURN_HOME 不复用旧 execution_id。
 `cleannav-system`
 
 记录各组件的精确 commit。
+
+<!-- M1_3_FRAMEWORK_FIRST_STATUS_START -->
+## M1-3 Framework-First Status
+
+M1-3 开始采用 framework-first 原则：Mock Navigation Adapter 当前只冻结通用 submit / cancel / callback、generation identity 和确定性测试机制，不冻结具体 Task、工作模式、Perception 接入方式或 Navigation Goal 的业务结构。
+<!-- M1_3_FRAMEWORK_FIRST_STATUS_END -->

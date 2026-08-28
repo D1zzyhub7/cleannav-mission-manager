@@ -900,3 +900,33 @@ M1 Full Mock Test
 4. Execution Store 必须遵循本文冻结的 command_id / execution_id / generation 生命周期；
 5. 继续保持纯领域层；
 6. 在 Pure State Machine 和 Mock Adapter 完成前，不创建真实 Navigation Adapter 集成。
+
+<!-- M1_FRAMEWORK_FIRST_PRINCIPLE_START -->
+## M1 Framework-First Principle
+
+M1 阶段的首要目标是建立 Mission Manager 的通用任务管理框架，而不是提前冻结最终业务形态。
+
+当前阶段只冻结跨业务稳定的机制，包括：
+
+- command / execution / generation 生命周期；
+- FIFO、幂等、暂停、恢复、停止、返航、急停等控制语义；
+- Navigation / Safety / HMI / Perception 等模块之间的职责边界；
+- Adapter 抽象、Mock 测试机制和异步回调收口；
+- stale callback、Lease、安全状态等系统级不变量。
+
+以下内容在 M1 当前阶段明确保持开放，不作为核心框架的冻结假设：
+
+- 最终工作模式的数量及名称；
+- 最终 Task Catalog 中包含哪些具体任务；
+- 是否以及如何接入目标检测 / Perception；
+- 感知目标是否自动生成任务、作为候选目标或仅作为环境观测；
+- Navigation Goal 最终采用 Pose、Path、Waypoint、目标对象或其他表示；
+- 具体任务是否依赖 leaf、puddle 或其他业务类别；
+- APP、语音、视觉等上游输入的最终组合方式。
+
+因此，M1 Core、Adapter 和 Mock 不得依赖具体 task_id、目标类别、模式数量或感知业务字段。
+
+当后续比赛需求、硬件方案、感知实现和 Navigation 接口进一步稳定后，再通过独立设计 Gate 决定上述业务层合同。
+
+原则：先冻结机制，再冻结业务；优先保持核心框架通用、可扩展、可替换。
+<!-- M1_FRAMEWORK_FIRST_PRINCIPLE_END -->
