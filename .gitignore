@@ -15,5 +15,23 @@ htmlcov/
 
 # Editor / OS
 .vscode/
+.idea/
 .DS_Store
 *~
+
+# Secrets and local credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime artifacts
+*.bag
+*.db
+*.db3
+*.sqlite
+*.sqlite3
+rosbag2_*/

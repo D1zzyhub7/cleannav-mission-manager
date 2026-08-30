@@ -24,15 +24,29 @@ CleanNav 任务生命周期管理、任务编排和执行状态管理。
 
 Mission Manager M0 已完成并冻结。
 
-Mission Manager M1 当前已经完成至：
+Mission Manager M1 当前已经完成：
 
-`M1-2g Execution Record Store`
+- `M1-2g Execution Record Store`
+- `M1-2h Generation / stale callback gate`
+- Pure State Machine 基础
+- PAUSE / STOP / RESUME / RETURN_HOME 控制取消与恢复语义
+- ESTOP / RESET_ESTOP latched 状态机
+- framework-first 原则
+- `M1-3 Mock Navigation Adapter`
+
+当前稳定开发点：
+
+`M1-3 CLOSED`
+
+当前最新代码 HEAD：
+
+`b8265eac8761bc350e2a8806621b6d85dfeccd3d`
 
 当前独立仓库适配已经完成。
 
-下一开发阶段：
+下一计划组件：
 
-`M1-2h Generation / stale callback gate`
+`M1-4 Mock Safety Adapter`
 
 ## 3. 当前 Git 基线
 
@@ -51,6 +65,15 @@ M1-2g Execution Record Store：
 原 monorepo M1-2g：
 
 `0830c301084df41fd2e39501c6d52e10c5465892`
+
+最近实现链：
+
+- `d4beb7a` Generation Gate
+- `c05366e` Pure State Machine
+- `5f6c756` control cancel/resume state machine
+- `8264e45` ESTOP latch state machine
+- `82b0322` framework-first principle
+- `b8265ea` Mock Navigation Adapter
 
 ## 4. 当前验证状态
 
@@ -89,6 +112,11 @@ M1 当前已经实现：
 7. FIFO Mission Queue
 8. Command Record Store
 9. Execution Record Store
+10. Generation / stale callback gate
+11. Pure State Machine 基础
+12. 控制取消与恢复语义
+13. ESTOP / RESET_ESTOP latched 状态机
+14. M1-3 Mock Navigation Adapter
 
 M1 总体执行方案已经冻结于：
 
@@ -98,13 +126,10 @@ M1 总体执行方案已经冻结于：
 
 下一阶段严格按照冻结方案继续：
 
-1. M1-2h Generation / stale callback gate
-2. Pure State Machine
-3. Mock Navigation Adapter
-4. Mock Safety Adapter
-5. Mission Manager Core
-6. ROS glue
-7. Full Mock Test
+1. M1-4 Mock Safety Adapter
+2. Mission Manager Core
+3. ROS glue
+4. Full Mock Test
 
 真实 Navigation Adapter 暂不提前接入。
 
@@ -222,10 +247,6 @@ RETURN_HOME 不复用旧 execution_id。
 
 以下内容当前不能宣称已经完成：
 
-- Generation gate
-- stale callback gate
-- 完整 Pure State Machine
-- Mock Navigation Adapter
 - Mock Safety Adapter
 - Mission Manager Core
 - ROS glue

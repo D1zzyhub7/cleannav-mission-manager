@@ -9,9 +9,11 @@
 当前开发状态：
 
 - M0：已完成并冻结
-- M1：已完成至 Execution Record Store
+- M1：已完成 M1-2g Execution Record Store、M1-2h Generation / stale callback gate、Pure State Machine 基础、PAUSE / STOP / RESUME / RETURN_HOME 控制取消与恢复语义、ESTOP / RESET_ESTOP latched 状态机、framework-first 原则，以及 M1-3 Mock Navigation Adapter
+- 当前稳定开发点：M1-3 CLOSED
+- 当前最新代码 HEAD：`b8265eac8761bc350e2a8806621b6d85dfeccd3d`
 - 独立仓库适配：已完成
-- 下一阶段：M1-2h Generation / stale callback gate
+- 下一计划组件：M1-4 Mock Safety Adapter
 
 当前验证环境：
 
@@ -39,11 +41,11 @@ Mission Manager 负责 CleanNav 的任务生命周期管理和任务执行编排
 - Mission FIFO Queue
 - Command Record Store
 - Execution Record Store
-- 后续 Generation / stale callback gate
-- 后续 Pure State Machine
-- 后续 Navigation / Safety Adapter
-- 后续 Mission Manager Core
-- 后续 ROS glue
+- Generation / stale callback gate
+- Pure State Machine 基础
+- PAUSE / STOP / RESUME / RETURN_HOME 控制取消与恢复语义
+- ESTOP / RESET_ESTOP latched 状态机
+- M1-3 Mock Navigation Adapter
 
 Mission Manager 不负责：
 
@@ -58,7 +60,20 @@ Mission Manager 不替代导航系统。
 
 最终运动命令仍由导航链路产生，并经过 Safety Supervisor 的最终安全门控。
 
-## 3. 当前核心依赖
+## 3. Framework-first 原则与通用 Adapter 合同
+
+Mission Manager 当前冻结通用框架，不提前冻结业务细节：
+
+- 不冻结最终 Task 数量和名称。
+- 不冻结最终工作模式集合。
+- 不冻结最终 Perception 接入业务结构。
+- 不冻结最终 Navigation Goal 业务结构。
+
+Mock Navigation Adapter 只冻结通用 `submit`、`cancel`、callback/event 和 generation identity 合同，不冻结具体导航业务。当前通用事件包括：
+
+`GOAL_ACCEPTED`、`GOAL_REJECTED`、`GOAL_SUCCEEDED`、`GOAL_FAILED`、`CANCEL_CONFIRMED`、`CANCEL_FAILED`
+
+## 4. 当前核心依赖
 
 运行依赖：
 
@@ -82,7 +97,7 @@ Mission Manager 不替代导航系统。
 
 因此 Mission Manager 不再依赖旧 monorepo 中两个源码 package 必须处于固定相邻目录的假设。
 
-## 4. 仓库结构
+## 5. 仓库结构
 
 当前仓库主要结构如下：
 
@@ -103,7 +118,7 @@ ROS 2 package 位于仓库根目录。
 
 这使得本仓库后续可以直接作为 CleanNav 系统工作区中的一个独立组件使用。
 
-## 5. 核心设计文档
+## 6. 核心设计文档
 
 当前保留的 Mission Manager 设计文档包括：
 
@@ -121,7 +136,7 @@ ROS 2 package 位于仓库根目录。
 - `docs/PROJECT_STATUS.md`
 - `docs/MONOREPO_MIGRATION.md`
 
-## 6. M1 当前实现
+## 7. M1 当前实现
 
 当前已经实现：
 
@@ -134,16 +149,21 @@ ROS 2 package 位于仓库根目录。
 7. FIFO Mission Queue
 8. Command Record Store
 9. Execution Record Store
+10. Generation / stale callback gate
+11. Pure State Machine 基础
+12. 控制取消与恢复语义
+13. ESTOP / RESET_ESTOP latched 状态机
+14. M1-3 Mock Navigation Adapter
 
 M1 总体执行方案已经冻结在：
 
 `docs/mission_manager_m1_execution_plan.md`
 
-下一阶段为：
+下一计划组件为：
 
-`M1-2h Generation / stale callback gate`
+`M1-4 Mock Safety Adapter`
 
-## 7. 已冻结的重要边界
+## 8. 已冻结的重要边界
 
 `command_id`、`execution_id` 和 `generation` 必须保持不同职责。
 
@@ -163,7 +183,11 @@ ESTOP 为 latched 模式。
 
 RESET_ESTOP 不自动恢复旧 execution、queue 或 generation。
 
-## 8. 构建与测试原则
+RETURN_HOME 必须先验证 home pose，并创建独立 execution，不复用被打断任务的旧 execution_id。
+
+旧 generation callback 必须作为 stale callback 丢弃，不得修改当前有效 execution。
+
+## 9. 构建与测试原则
 
 本仓库可以独立作为 ROS 2 package 构建。
 
@@ -175,7 +199,7 @@ RESET_ESTOP 不自动恢复旧 execution、queue 或 generation。
 
 建议将 colcon 的 build、install 和 log 输出放在工作区或独立验证目录，而不是源码 package 根目录中。
 
-## 9. Git 历史说明
+## 10. Git 历史说明
 
 本仓库的早期 Git 历史来自原 CleanNav monorepo。
 
@@ -193,7 +217,7 @@ Mission Manager 的有效开发顺序和相关文件历史已经保留。
 
 中永久记录。
 
-## 10. 当前关键 Git 基线
+## 11. 当前关键 Git 基线
 
 M0 最终冻结：
 
