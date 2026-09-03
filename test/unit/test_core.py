@@ -61,6 +61,42 @@ def _catalog():
             enabled=True,
             allowed_sources=frozenset({int(CommandSource.APP)}),
         ),
+        3: TaskCatalogEntry(
+            task_id=3,
+            name='RESUME_CURRENT_TASK',
+            task_kind=TaskKind.CONTROL,
+            enabled=True,
+            allowed_sources=frozenset({int(CommandSource.APP)}),
+        ),
+        4: TaskCatalogEntry(
+            task_id=4,
+            name='STOP_CURRENT_TASK',
+            task_kind=TaskKind.CONTROL,
+            enabled=True,
+            allowed_sources=frozenset({int(CommandSource.APP)}),
+        ),
+        5: TaskCatalogEntry(
+            task_id=5,
+            name='RETURN_HOME',
+            task_kind=TaskKind.CONTROL,
+            enabled=False,
+            allowed_sources=frozenset({int(CommandSource.APP)}),
+        ),
+        6: TaskCatalogEntry(
+            task_id=6,
+            name='SOFTWARE_EMERGENCY_STOP',
+            task_kind=TaskKind.CONTROL,
+            enabled=True,
+            allowed_sources=frozenset({int(CommandSource.APP)}),
+        ),
+        7: TaskCatalogEntry(
+            task_id=7,
+            name='RESET_SOFTWARE_EMERGENCY_STOP',
+            task_kind=TaskKind.CONTROL,
+            enabled=True,
+            allowed_sources=frozenset({int(CommandSource.APP)}),
+            requires_confirmation=True,
+        ),
         30: TaskCatalogEntry(
             task_id=30,
             name='CLEAN_NEAREST_LEAF',
@@ -113,7 +149,12 @@ class DeterministicIdFactory:
         return f'execution-{self._counter}'
 
 
-def _build(*, acquire_success=True, release_success=True):
+def _build(
+    *,
+    acquire_success=True,
+    release_success=True,
+    reset_success=True,
+):
     holder = {}
     goals = []
 
@@ -124,6 +165,7 @@ def _build(*, acquire_success=True, release_success=True):
         lambda event: holder['core'].handle_safety_event(event),
         acquire_success=acquire_success,
         release_success=release_success,
+        reset_success=reset_success,
     )
 
     def resolve(command, task):
@@ -410,6 +452,254 @@ def test_safety_event_for_other_execution_does_not_pollute_active_execution():
     assert len(safety.calls) == 1
 
 
+def test_pause_cleans_up_navigation_and_lease_then_preserves_execution():
+    core, navigation, safety, _ = _build()
+    command, handle = _start_executing(core, navigation, safety)
+    generation = handle.generation
+
+    result = core.submit_command(
+        _command(command_id='pause-1', task_id=2)
+    )
+
+    assert result.accepted
+    assert core.active_execution is not None
+    assert core.active_execution.execution_id == handle.execution_id
+    assert core.active_execution.generation == generation
+    assert core.active_context.state is InternalExecutionState.CANCELING
+    assert len(navigation.cancel_calls) == 1
+    assert safety.calls[-1].operation.value == 'RELEASE_LEASE'
+
+    navigation.inject_event(
+        NavigationEvent(handle, NavigationEventType.CANCEL_CONFIRMED)
+    )
+    safety.emit_release_result(handle.execution_id)
+
+    assert core.active_execution is not None
+    assert core.active_execution.command_id == command.command_id
+    assert core.active_execution.state is InternalExecutionState.PAUSED
+    assert core.active_execution.generation == generation
+
+
+def test_repeated_pause_while_paused_has_no_dangerous_side_effect():
+    core, navigation, safety, _ = _build()
+    _, handle = _start_executing(core, navigation, safety)
+    core.submit_command(_command(command_id='pause-1', task_id=2))
+    navigation.inject_event(
+        NavigationEvent(handle, NavigationEventType.CANCEL_CONFIRMED)
+    )
+    safety.emit_release_result(handle.execution_id)
+    before_cancel = len(navigation.cancel_calls)
+    before_safety = len(safety.calls)
+
+    result = core.submit_command(
+        _command(command_id='pause-2', task_id=2)
+    )
+
+    assert result.accepted
+    assert len(navigation.cancel_calls) == before_cancel
+    assert len(safety.calls) == before_safety
+
+
+def test_resume_preserves_execution_advances_generation_and_resubmits():
+    core, navigation, safety, goals = _build()
+    _, old_handle = _start_executing(core, navigation, safety)
+    core.submit_command(_command(command_id='pause-1', task_id=2))
+    navigation.inject_event(
+        NavigationEvent(old_handle, NavigationEventType.CANCEL_CONFIRMED)
+    )
+    safety.emit_release_result(old_handle.execution_id)
+
+    result = core.submit_command(
+        _command(command_id='resume-1', task_id=3)
+    )
+
+    new_handle = core.active_generation_handle
+    assert result.accepted
+    assert new_handle is not None
+    assert new_handle.execution_id == old_handle.execution_id
+    assert new_handle.generation == old_handle.generation + 1
+    assert core.active_execution is not None
+    assert core.active_execution.execution_id == old_handle.execution_id
+    assert core.active_execution.generation == 2
+    assert len(navigation.submitted_calls) == 2
+    assert navigation.submitted_calls[-1].handle == new_handle
+    assert goals == [('command-1', 30), ('command-1', 30)]
+
+    for stale_type in (
+        NavigationEventType.GOAL_ACCEPTED,
+        NavigationEventType.SUCCEEDED,
+        NavigationEventType.FAILED,
+        NavigationEventType.CANCEL_CONFIRMED,
+        NavigationEventType.CANCEL_FAILED,
+    ):
+        stale_result = core.handle_navigation_event(
+            NavigationEvent(old_handle, stale_type)
+        )
+        assert not stale_result.accepted
+        assert stale_result.stale
+    assert core.active_execution.state is (
+        InternalExecutionState.NAVIGATION_STARTING
+    )
+    assert len(safety.calls) == 2
+
+    navigation.inject_event(
+        NavigationEvent(new_handle, NavigationEventType.GOAL_ACCEPTED)
+    )
+    assert safety.calls[-1].operation.value == 'ACQUIRE_LEASE'
+    safety.emit_acquire_result(new_handle.execution_id)
+    assert core.active_execution.state is InternalExecutionState.EXECUTING
+
+
+def test_stop_clears_waiting_queue_and_does_not_activate_next_mission():
+    core, navigation, safety, _ = _build()
+    _, handle = _start_executing(core, navigation, safety)
+    core.submit_command(
+        _command(command_id='command-2', task_id=31)
+    )
+
+    result = core.submit_command(
+        _command(command_id='stop-1', task_id=4)
+    )
+
+    assert result.accepted
+    assert core.queued_missions == ()
+    assert len(navigation.cancel_calls) == 1
+    assert safety.calls[-1].operation.value == 'RELEASE_LEASE'
+    navigation.inject_event(
+        NavigationEvent(handle, NavigationEventType.CANCEL_CONFIRMED)
+    )
+    safety.emit_release_result(handle.execution_id)
+
+    assert core.active_execution is None
+    assert len(navigation.submitted_calls) == 1
+    terminal = core._command_store.get_current_command_status('command-1')
+    assert terminal is not None
+    assert terminal.state is ExternalTaskState.CANCELED
+
+
+def test_estop_clears_queue_requests_safety_and_latches_after_cleanup():
+    core, navigation, safety, _ = _build()
+    _, handle = _start_executing(core, navigation, safety)
+    core.submit_command(
+        _command(command_id='command-2', task_id=31)
+    )
+
+    result = core.submit_command(
+        _command(command_id='estop-1', task_id=6)
+    )
+
+    assert result.accepted
+    assert core.queued_missions == ()
+    assert core.manager_mode.value == 'EMERGENCY_LATCHED'
+    assert safety.calls[-2].operation.value == 'REQUEST_EMERGENCY_STOP'
+    assert len(navigation.cancel_calls) == 1
+    assert safety.calls[-1].operation.value == 'RELEASE_LEASE'
+
+    navigation.inject_event(
+        NavigationEvent(handle, NavigationEventType.CANCEL_CONFIRMED)
+    )
+    safety.emit_release_result(handle.execution_id)
+
+    assert core.active_execution is None
+    assert core.manager_mode.value == 'EMERGENCY_LATCHED'
+    assert core.active_context.state is InternalExecutionState.IDLE
+
+    replay = core.submit_command(_command(command_id='estop-1', task_id=6))
+    assert replay.accepted
+    assert len([call for call in safety.calls
+                if call.operation.value == 'REQUEST_EMERGENCY_STOP']) == 1
+
+
+def test_idle_estop_requests_safety_and_latches_without_execution():
+    core, _, safety, _ = _build()
+
+    result = core.submit_command(
+        _command(command_id='estop-idle', task_id=6)
+    )
+
+    assert result.accepted
+    assert core.active_execution is None
+    assert core.manager_mode.value == 'EMERGENCY_LATCHED'
+    assert len(safety.calls) == 1
+    assert safety.calls[0].operation.value == 'REQUEST_EMERGENCY_STOP'
+
+
+def test_reset_waits_for_success_and_returns_to_normal_without_resuming():
+    core, navigation, safety, _ = _build()
+    _, handle = _start_executing(core, navigation, safety)
+    core.submit_command(_command(command_id='pause-1', task_id=2))
+    navigation.inject_event(
+        NavigationEvent(handle, NavigationEventType.CANCEL_CONFIRMED)
+    )
+    safety.emit_release_result(handle.execution_id)
+    core.submit_command(_command(command_id='estop-1', task_id=6))
+
+    reset = core.submit_command(
+        _command(command_id='reset-1', task_id=7)
+    )
+    assert reset.accepted
+    assert core.manager_mode.value == 'EMERGENCY_LATCHED'
+    assert core.active_execution is None
+    assert safety.calls[-1].operation.value == 'RESET_EMERGENCY_STOP'
+
+    safety.emit_reset_result()
+
+    assert core.manager_mode.value == 'NORMAL'
+    assert core.active_execution is None
+    assert len(navigation.submitted_calls) == 1
+
+
+def test_reset_failure_stays_latched_and_replay_does_not_repeat_reset():
+    core, _, safety, _ = _build(reset_success=False)
+    core.submit_command(_command(command_id='estop-1', task_id=6))
+    reset = core.submit_command(
+        _command(command_id='reset-1', task_id=7)
+    )
+    assert reset.accepted
+    safety.emit_reset_result()
+
+    assert core.manager_mode.value == 'EMERGENCY_LATCHED'
+    assert safety.calls[-1].operation.value == 'RESET_EMERGENCY_STOP'
+    terminal = core._command_store.get_current_command_status('reset-1')
+    assert terminal is not None
+    assert terminal.state is ExternalTaskState.FAILED
+    before = len(safety.calls)
+    replay = core.submit_command(
+        _command(command_id='reset-1', task_id=7)
+    )
+    assert replay.accepted
+    assert len(safety.calls) == before
+
+
+def test_return_home_is_rejected_by_existing_catalog():
+    core, navigation, safety, _ = _build()
+
+    result = core.submit_command(
+        _command(command_id='home-1', task_id=5)
+    )
+
+    assert not result.accepted
+    assert result.reason_code is CommandReason.TASK_DISABLED
+    assert navigation.submitted_calls == ()
+    assert safety.calls == ()
+
+
+def test_voice_reset_is_rejected_by_existing_catalog_source_rules():
+    core, _, safety, _ = _build()
+
+    result = core.submit_command(
+        _command(
+            command_id='reset-voice',
+            task_id=7,
+            source=CommandSource.VOICE,
+        )
+    )
+
+    assert not result.accepted
+    assert result.reason_code is CommandReason.SOURCE_NOT_ALLOWED
+    assert safety.calls == ()
+
+
 def test_control_is_not_queued_and_is_explicitly_unsupported():
     core, navigation, safety, goals = _build()
 
@@ -417,7 +707,7 @@ def test_control_is_not_queued_and_is_explicitly_unsupported():
 
     assert not result.accepted
     assert not result.supported
-    assert 'unsupported' in result.message
+    assert 'active execution' in result.message
     assert core.queued_missions == ()
     assert core.active_execution is None
     assert navigation.submitted_calls == ()
@@ -425,7 +715,7 @@ def test_control_is_not_queued_and_is_explicitly_unsupported():
     assert goals == []
 
 
-def test_reset_safety_event_has_explicit_unsupported_entry_point_result():
+def test_unexpected_reset_safety_event_is_rejected():
     core, _, _, _ = _build()
 
     result = core.handle_safety_event(
@@ -435,8 +725,8 @@ def test_reset_safety_event_has_explicit_unsupported_entry_point_result():
     )
 
     assert not result.accepted
-    assert not result.supported
-    assert 'later slice' in result.message
+    assert result.reason_code is CommandReason.ACTIVE_EXECUTION_CONFLICT
+    assert 'unexpected' in result.message
 
 
 def test_core_source_has_no_forbidden_dependencies_or_generation_safety():

@@ -45,6 +45,7 @@ from cleannav_mission_manager.domain.models import (
     CommandRecordState,
     ExecutionRecord,
     InternalExecutionState,
+    ManagerMode,
 )
 from cleannav_mission_manager.domain.state_machine import (
     StateMachineContext,
@@ -134,6 +135,8 @@ class MissionManagerCore:
         self._active_context: Optional[StateMachineContext] = None
         self._active_mission: Optional[QueuedMission] = None
         self._active_goal: object | None = None
+        self._manager_mode = ManagerMode.NORMAL
+        self._pending_reset_command: Optional[NormalizedTaskCommand] = None
 
     @property
     def active_execution(self) -> Optional[ExecutionRecord]:
@@ -154,6 +157,11 @@ class MissionManagerCore:
     def active_generation_handle(self) -> Optional[GenerationHandle]:
         """Return the currently registered navigation generation."""
         return self._generation_gate.active_handle
+
+    @property
+    def manager_mode(self) -> ManagerMode:
+        """Return the current manager-level mode."""
+        return self._manager_mode
 
     def submit_command(
         self,
@@ -211,22 +219,9 @@ class MissionManagerCore:
             raise RuntimeError('accepted validation returned no task')
 
         if validation.task.task_kind is TaskKind.CONTROL:
-            self._command_store.update_record(
-                command.command_id,
-                state=CommandRecordState.TERMINAL,
-                reason_code=int(CommandReason.COMMAND_VALID),
-            )
-            self._write_command_status(
+            return self._submit_control(
                 command,
-                execution_id='',
-                state=ExternalTaskState.REJECTED,
-                reason_code=CommandReason.COMMAND_VALID,
-            )
-            return CoreResult(
-                accepted=False,
-                reason_code=CommandReason.COMMAND_VALID,
-                supported=False,
-                message='CONTROL orchestration is unsupported in this slice',
+                validation.task,
             )
 
         enqueue = self._mission_queue.enqueue(command, validation.task)
@@ -270,6 +265,151 @@ class MissionManagerCore:
             reason_code=CommandReason.COMMAND_QUEUED,
             execution_id=(record.execution_id if record is not None else None),
         )
+
+    def _submit_control(
+        self,
+        command: NormalizedTaskCommand,
+        task: TaskCatalogEntry,
+    ) -> CoreResult:
+        """Route a validated CONTROL without entering MissionQueue."""
+        control_events = {
+            2: StateMachineEvent.PAUSE_REQUESTED,
+            3: StateMachineEvent.RESUME_ALLOWED,
+            4: StateMachineEvent.STOP_REQUESTED,
+            6: StateMachineEvent.ESTOP_REQUESTED,
+        }
+        if task.task_id == 7:
+            return self._submit_reset_control(command)
+
+        event = control_events.get(task.task_id)
+        if event is None:
+            return self._reject_control(
+                command,
+                'CONTROL task is unsupported in this slice',
+            )
+
+        if event is StateMachineEvent.STOP_REQUESTED:
+            self._clear_waiting_queue()
+
+        if event is StateMachineEvent.ESTOP_REQUESTED:
+            self._clear_waiting_queue()
+
+        if (
+            self._active_context is None
+            and event in (
+                StateMachineEvent.PAUSE_REQUESTED,
+                StateMachineEvent.RESUME_ALLOWED,
+            )
+        ):
+            return self._reject_control(
+                command,
+                'CONTROL requires an active execution',
+            )
+
+        result = self._apply_event(event)
+        if not result.accepted:
+            return self._reject_control(
+                command,
+                result.message or 'CONTROL event rejected by State Machine',
+            )
+
+        self._mark_control_applied(command)
+        return CoreResult(
+            accepted=True,
+            reason_code=CommandReason.COMMAND_VALID,
+            execution_id=(
+                self.active_execution.execution_id
+                if self.active_execution is not None
+                else None
+            ),
+        )
+
+    def _submit_reset_control(
+        self,
+        command: NormalizedTaskCommand,
+    ) -> CoreResult:
+        """Request reset and wait for the Safety adapter result event."""
+        context = self._active_context
+        if context is None:
+            context = StateMachineContext(
+                state=InternalExecutionState.IDLE,
+                manager_mode=self._manager_mode,
+            )
+        decision = transition(context, StateMachineEvent.RESET_ESTOP_ALLOWED)
+        if not decision.accepted:
+            return self._reject_control(
+                command,
+                'RESET_ESTOP is not currently allowed',
+            )
+
+        self._pending_reset_command = command
+        self._mark_control_applied(command)
+        self._safety.reset_emergency_stop()
+        return CoreResult(
+            accepted=True,
+            reason_code=CommandReason.COMMAND_VALID,
+            message='waiting for safety reset result',
+        )
+
+    def _mark_control_applied(
+        self,
+        command: NormalizedTaskCommand,
+    ) -> None:
+        """Persist a nonterminal accepted CONTROL status for replay."""
+        self._command_store.update_record(
+            command.command_id,
+            state=CommandRecordState.APPLIED,
+            reason_code=int(CommandReason.COMMAND_VALID),
+        )
+        self._write_command_status(
+            command,
+            execution_id=(
+                self.active_execution.execution_id
+                if self.active_execution is not None
+                else ''
+            ),
+            state=ExternalTaskState.ACCEPTED,
+            reason_code=CommandReason.COMMAND_VALID,
+        )
+
+    def _reject_control(
+        self,
+        command: NormalizedTaskCommand,
+        message: str,
+    ) -> CoreResult:
+        """Persist an explicit CONTROL rejection for future replay."""
+        self._command_store.update_record(
+            command.command_id,
+            state=CommandRecordState.TERMINAL,
+            reason_code=int(CommandReason.COMMAND_VALID),
+        )
+        self._write_command_status(
+            command,
+            execution_id='',
+            state=ExternalTaskState.REJECTED,
+            reason_code=CommandReason.COMMAND_VALID,
+        )
+        return CoreResult(
+            accepted=False,
+            reason_code=CommandReason.COMMAND_VALID,
+            supported=False,
+            message=message,
+        )
+
+    def _clear_waiting_queue(self) -> None:
+        """Cancel queued missions through existing queue/store APIs."""
+        for item in self._mission_queue.clear():
+            self._command_store.update_record(
+                item.command.command_id,
+                state=CommandRecordState.TERMINAL,
+                reason_code=int(CommandReason.NONE),
+            )
+            self._write_command_status(
+                item.command,
+                execution_id='',
+                state=ExternalTaskState.CANCELED,
+                reason_code=CommandReason.NONE,
+            )
 
     def handle_navigation_event(
         self,
@@ -348,17 +488,81 @@ class MissionManagerCore:
             SafetyEventType.RESET_EMERGENCY_STOP_SUCCEEDED,
             SafetyEventType.RESET_EMERGENCY_STOP_FAILED,
         ):
+            if self._pending_reset_command is None:
+                return CoreResult(
+                    accepted=False,
+                    reason_code=CommandReason.ACTIVE_EXECUTION_CONFLICT,
+                    message='unexpected safety reset result',
+                )
+
+            command = self._pending_reset_command
+            self._pending_reset_command = None
+            if event.event_type is SafetyEventType.RESET_EMERGENCY_STOP_FAILED:
+                self._command_store.update_record(
+                    command.command_id,
+                    state=CommandRecordState.TERMINAL,
+                    reason_code=int(CommandReason.NONE),
+                )
+                self._write_command_status(
+                    command,
+                    execution_id='',
+                    state=ExternalTaskState.FAILED,
+                    reason_code=CommandReason.NONE,
+                )
+                return CoreResult(
+                    accepted=False,
+                    reason_code=CommandReason.NONE,
+                    supported=True,
+                    message='safety emergency-stop reset failed',
+                )
+
+            result = self._apply_event(
+                StateMachineEvent.RESET_ESTOP_ALLOWED
+            )
+            if not result.accepted:
+                raise RuntimeError(
+                    'Safety reset succeeded but State Machine rejected reset'
+                )
+            self._active_context = None
+            self._command_store.update_record(
+                command.command_id,
+                state=CommandRecordState.TERMINAL,
+                reason_code=int(CommandReason.NONE),
+            )
+            self._write_command_status(
+                command,
+                execution_id='',
+                state=ExternalTaskState.SUCCEEDED,
+                reason_code=CommandReason.NONE,
+            )
             return CoreResult(
-                accepted=False,
-                reason_code=CommandReason.COMMAND_VALID,
-                supported=False,
-                message=(
-                    'RESET_ESTOP orchestration is reserved for a '
-                    'later slice'
-                ),
+                accepted=True,
+                reason_code=CommandReason.NONE,
+                message='safety emergency-stop reset succeeded',
             )
 
         raise ValueError('unsupported SafetyEventType')
+
+    def _prepare_and_submit_current_goal(self) -> None:
+        """Resolve and submit the next goal for the current generation."""
+        if self._active_mission is None:
+            raise GoalResolutionError(
+                'current execution has no mission context'
+            )
+        goal = self._goal_resolver(
+            self._active_mission.command,
+            self._active_mission.task,
+        )
+        if goal is None:
+            raise GoalResolutionError(
+                'goal resolver returned None for current mission'
+            )
+        self._active_goal = goal
+        result = self._apply_event(StateMachineEvent.GOAL_PREPARED)
+        if not result.accepted:
+            raise RuntimeError(
+                'State Machine rejected prepared resumed goal'
+            )
 
     def _activate_next(self) -> None:
         """Activate at most one queued mission and submit its first goal."""
@@ -420,30 +624,38 @@ class MissionManagerCore:
 
     def _apply_event(self, event: StateMachineEvent) -> CoreResult:
         """Apply one domain event, then execute all emitted effects."""
-        if self._active_context is None or self.active_execution is None:
-            return CoreResult(
-                accepted=False,
-                reason_code=CommandReason.ACTIVE_EXECUTION_CONFLICT,
-                message='no active execution',
+        context = self._active_context
+        if context is None:
+            if event is not StateMachineEvent.ESTOP_REQUESTED:
+                return CoreResult(
+                    accepted=False,
+                    reason_code=CommandReason.ACTIVE_EXECUTION_CONFLICT,
+                    message='no active execution',
+                )
+            context = StateMachineContext(
+                state=InternalExecutionState.IDLE,
+                manager_mode=self._manager_mode,
             )
 
-        decision = transition(self._active_context, event)
+        decision = transition(context, event)
         if not decision.accepted:
             return CoreResult(
                 accepted=False,
                 reason_code=CommandReason.NONE,
-                execution_id=self.active_execution.execution_id,
+                execution_id=(
+                    self.active_execution.execution_id
+                    if self.active_execution is not None
+                    else None
+                ),
                 message='State Machine rejected event',
             )
 
         self._active_context = decision.next_context
+        self._manager_mode = decision.next_context.manager_mode
         record = self.active_execution
-        if record is None:
-            raise RuntimeError(
-                'active execution disappeared during transition'
-            )
-        self._sync_execution_record(record, decision.next_context)
-        self._write_running_status(record, decision.next_context)
+        if record is not None:
+            self._sync_execution_record(record, decision.next_context)
+            self._write_running_status(record, decision.next_context)
 
         for effect in decision.effects:
             self._execute_effect(effect, decision)
@@ -451,7 +663,7 @@ class MissionManagerCore:
         return CoreResult(
             accepted=True,
             reason_code=CommandReason.NONE,
-            execution_id=record.execution_id,
+            execution_id=(record.execution_id if record is not None else None),
         )
 
     def _execute_effect(
@@ -461,7 +673,13 @@ class MissionManagerCore:
     ) -> None:
         """Execute one known effect or expose an unsupported one."""
         record = self.active_execution
-        if record is None:
+        if (
+            record is None
+            and effect not in (
+                TransitionEffect.REQUEST_SAFETY_ESTOP,
+                TransitionEffect.TERMINAL_EMERGENCY_STOPPED,
+            )
+        ):
             raise RuntimeError(f'effect {effect.name} has no active execution')
 
         if effect is TransitionEffect.SUBMIT_NAVIGATION:
@@ -503,6 +721,29 @@ class MissionManagerCore:
             self._safety.request_emergency_stop()
             return
 
+        if effect is TransitionEffect.ADVANCE_GENERATION:
+            if record is None or self._active_mission is None:
+                raise RuntimeError(
+                    'generation advance has no active execution context'
+                )
+            advanced = self._execution_store.advance_generation(
+                record.execution_id
+            )
+            if not advanced.advanced:
+                raise RuntimeError(
+                    'Execution Store rejected generation advance: '
+                    f'{advanced.reason_code.name}'
+                )
+            old_handle = self._generation_gate.active_handle
+            if old_handle is not None:
+                retired = self._generation_gate.retire(old_handle)
+                if not retired.retired:
+                    raise RuntimeError(
+                        'failed to retire paused navigation generation'
+                    )
+            self._prepare_and_submit_current_goal()
+            return
+
         if effect is TransitionEffect.TERMINAL_SUCCEEDED:
             self._finish_execution(
                 record,
@@ -525,6 +766,8 @@ class MissionManagerCore:
             return
 
         if effect is TransitionEffect.TERMINAL_EMERGENCY_STOPPED:
+            if record is None:
+                return
             self._finish_execution(
                 record,
                 ExternalTaskState.EMERGENCY_STOPPED,
@@ -575,6 +818,11 @@ class MissionManagerCore:
         self._active_context = None
         self._active_mission = None
         self._active_goal = None
+        if self._manager_mode is ManagerMode.EMERGENCY_LATCHED:
+            self._active_context = StateMachineContext(
+                state=InternalExecutionState.IDLE,
+                manager_mode=ManagerMode.EMERGENCY_LATCHED,
+            )
         self._activate_next()
 
     def _sync_execution_record(
