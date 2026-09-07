@@ -23,10 +23,23 @@ from cleannav_mission_manager.adapters.mock_navigation import (
 from cleannav_mission_manager.adapters.mock_safety import (
     MockSafetyAdapter,
 )
-from cleannav_mission_manager.adapters.navigation import NavigationEvent
-from cleannav_mission_manager.adapters.safety import SafetyEvent
+from cleannav_mission_manager.adapters.navigation import (
+    NavigationAdapter,
+    NavigationEvent,
+)
+from cleannav_mission_manager.adapters.real_navigation import (
+    RealNavigationAdapter,
+)
+from cleannav_mission_manager.adapters.real_safety import (
+    RealSafetyAdapter,
+)
+from cleannav_mission_manager.adapters.safety import (
+    SafetyAdapter,
+    SafetyEvent,
+)
 from cleannav_mission_manager.core import (
     CoreResult,
+    GoalResolver,
     MissionManagerCore,
 )
 from cleannav_mission_manager.domain.command_processing import (
@@ -66,13 +79,13 @@ class _RosClockAdapter:
 
 @dataclass(frozen=True)
 class RuntimeComposition:
-    """Concrete dependencies assembled for the explicit mock runtime."""
+    """Concrete dependencies assembled for one Mission Manager runtime."""
 
     core: MissionManagerCore
     command_store: CommandRecordStore
     execution_store: ExecutionRecordStore
-    navigation: MockNavigationAdapter
-    safety: MockSafetyAdapter
+    navigation: NavigationAdapter
+    safety: SafetyAdapter
 
 
 RuntimeFactory = Callable[['MissionManagerNode'], RuntimeComposition]
@@ -170,31 +183,17 @@ class MissionManagerNode(Node):
 
     @property
     def runtime(self) -> RuntimeComposition | None:
-        """Return the mock composition for integration tests, if present."""
+        """Return the assembled runtime for integration tests, if present."""
         return self._runtime
 
     def _create_mock_runtime(self) -> RuntimeComposition:
-        """Build the only currently supported, explicitly named runtime."""
-        catalog_share = Path(
-            get_package_share_directory('cleannav_interfaces')
-        )
-        catalog = load_task_catalog(
-            catalog_share / 'config' / 'task_catalog.yaml'
-        )
-
+        """Build the default deterministic runtime with mock adapters."""
         navigation = MockNavigationAdapter(
-            lambda event: self._on_navigation_event(event)
+            self._on_navigation_event
         )
         safety = MockSafetyAdapter(
-            lambda event: self._on_safety_event(event)
+            self._on_safety_event
         )
-
-        execution_counter = 0
-
-        def make_execution_id() -> str:
-            nonlocal execution_counter
-            execution_counter += 1
-            return f'ros-execution-{execution_counter}'
 
         def resolve_goal(
             command: NormalizedTaskCommand,
@@ -203,7 +202,55 @@ class MissionManagerNode(Node):
             """Return a deterministic opaque payload for mock navigation."""
             return ('mock-goal', command.command_id, task.task_id)
 
+        return self._create_runtime(
+            navigation=navigation,
+            safety=safety,
+            goal_resolver=resolve_goal,
+        )
+
+    def create_real_runtime(
+        self,
+        goal_resolver: GoalResolver,
+    ) -> RuntimeComposition:
+        """Build a real-adapter runtime with an injected goal resolver."""
+        navigation = RealNavigationAdapter(
+            self,
+            self._on_navigation_event,
+        )
+        safety = RealSafetyAdapter(
+            self,
+            self._on_safety_event,
+        )
+        return self._create_runtime(
+            navigation=navigation,
+            safety=safety,
+            goal_resolver=goal_resolver,
+        )
+
+    def _create_runtime(
+        self,
+        *,
+        navigation: NavigationAdapter,
+        safety: SafetyAdapter,
+        goal_resolver: GoalResolver,
+    ) -> RuntimeComposition:
+        """Assemble shared stores, queue, gate and orchestration core."""
+        catalog_share = Path(
+            get_package_share_directory('cleannav_interfaces')
+        )
+        catalog = load_task_catalog(
+            catalog_share / 'config' / 'task_catalog.yaml'
+        )
+
         command_store = CommandRecordStore(32)
+
+        execution_counter = 0
+
+        def make_execution_id() -> str:
+            nonlocal execution_counter
+            execution_counter += 1
+            return f'ros-execution-{execution_counter}'
+
         execution_store = ExecutionRecordStore(
             id_factory=make_execution_id,
             terminal_cache=TerminalStatusCache(32),
@@ -217,7 +264,7 @@ class MissionManagerNode(Node):
             navigation=navigation,
             safety=safety,
             clock=_RosClockAdapter(self),
-            goal_resolver=resolve_goal,
+            goal_resolver=goal_resolver,
         )
         return RuntimeComposition(
             core=core,

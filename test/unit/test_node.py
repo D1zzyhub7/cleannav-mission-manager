@@ -5,6 +5,7 @@ import inspect
 
 import pytest
 import rclpy
+from geometry_msgs.msg import PoseStamped
 from rclpy.parameter import Parameter
 from rclpy.qos import (
     DurabilityPolicy,
@@ -18,11 +19,25 @@ from cleannav_mission_manager.adapters.navigation import (
     NavigationEvent,
     NavigationEventType,
 )
+from cleannav_mission_manager.adapters.mock_navigation import (
+    MockNavigationAdapter,
+)
+from cleannav_mission_manager.adapters.mock_safety import MockSafetyAdapter
+from cleannav_mission_manager.adapters.real_navigation import (
+    RealNavigationAdapter,
+)
+from cleannav_mission_manager.adapters.real_safety import RealSafetyAdapter
 from cleannav_mission_manager.core import CoreResult
 from cleannav_mission_manager.domain.command_processing import (
     CommandReason,
     NormalizedTaskCommand,
 )
+from cleannav_mission_manager.domain.command_store import CommandRecordStore
+from cleannav_mission_manager.domain.execution_store import (
+    ExecutionRecordStore,
+)
+from cleannav_mission_manager.domain.generation_gate import GenerationGate
+from cleannav_mission_manager.domain.mission_queue import MissionQueue
 from cleannav_mission_manager.node import MissionManagerNode
 
 
@@ -91,6 +106,81 @@ def test_node_name_and_explicit_mock_runtime():
         assert node.get_name() == 'mission_manager_node'
         assert node.runtime_mode == 'mock'
         assert node.runtime is not None
+        assert isinstance(node.runtime.navigation, MockNavigationAdapter)
+        assert isinstance(node.runtime.safety, MockSafetyAdapter)
+    finally:
+        node.destroy_node()
+
+
+def test_explicit_real_runtime_wires_real_adapters_and_injected_resolver():
+    def resolver(command, task):
+        pose = PoseStamped()
+        pose.header.frame_id = 'map'
+        pose.pose.orientation.w = 1.0
+        return pose
+
+    node = _node(
+        runtime_factory=(
+            lambda current: current.create_real_runtime(resolver)
+        ),
+    )
+    try:
+        runtime = node.runtime
+        assert runtime is not None
+        assert isinstance(runtime.navigation, RealNavigationAdapter)
+        assert isinstance(runtime.safety, RealSafetyAdapter)
+        assert not isinstance(runtime.navigation, MockNavigationAdapter)
+        assert not isinstance(runtime.safety, MockSafetyAdapter)
+        assert runtime.core._goal_resolver is resolver
+        assert runtime.core._navigation is runtime.navigation
+        assert runtime.core._safety is runtime.safety
+    finally:
+        node.destroy_node()
+
+
+def test_real_runtime_uses_common_stores_and_preserves_execution_id_factory():
+    def resolver(command, task):
+        return PoseStamped()
+
+    node = _node(
+        runtime_factory=(
+            lambda current: current.create_real_runtime(resolver)
+        ),
+    )
+    try:
+        runtime = node.runtime
+        assert runtime is not None
+        assert isinstance(runtime.command_store, CommandRecordStore)
+        assert isinstance(runtime.execution_store, ExecutionRecordStore)
+        assert isinstance(runtime.core._mission_queue, MissionQueue)
+        assert isinstance(runtime.core._generation_gate, GenerationGate)
+        assert runtime.execution_store._id_factory() == 'ros-execution-1'
+    finally:
+        node.destroy_node()
+
+
+def test_real_runtime_adapter_event_sinks_return_to_node_callbacks():
+    def resolver(command, task):
+        return PoseStamped()
+
+    node = _node(
+        runtime_factory=(
+            lambda current: current.create_real_runtime(resolver)
+        ),
+    )
+    try:
+        runtime = node.runtime
+        assert runtime is not None
+
+        navigation_sink = runtime.navigation._event_sink
+        safety_sink = runtime.safety._event_sink
+        assert navigation_sink.__self__ is node
+        assert (
+            navigation_sink.__func__
+            is MissionManagerNode._on_navigation_event
+        )
+        assert safety_sink.__self__ is node
+        assert safety_sink.__func__ is MissionManagerNode._on_safety_event
     finally:
         node.destroy_node()
 
