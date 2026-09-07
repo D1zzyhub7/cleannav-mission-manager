@@ -126,6 +126,7 @@ def _command(
     command_id='command-1',
     task_id=30,
     source=CommandSource.APP,
+    user_confirmed=False,
 ):
     return NormalizedTaskCommand(
         interface_version='1.0',
@@ -135,6 +136,7 @@ def _command(
         stamp_ns=1_000_000_000,
         valid_for_ns=10_000_000_000,
         confidence=1.0,
+        user_confirmed=user_confirmed,
     )
 
 
@@ -635,7 +637,9 @@ def test_reset_waits_for_success_and_returns_to_normal_without_resuming():
     core.submit_command(_command(command_id='estop-1', task_id=6))
 
     reset = core.submit_command(
-        _command(command_id='reset-1', task_id=7)
+        _command(
+            command_id='reset-1', task_id=7, user_confirmed=True
+        )
     )
     assert reset.accepted
     assert core.manager_mode.value == 'EMERGENCY_LATCHED'
@@ -653,7 +657,9 @@ def test_reset_failure_stays_latched_and_replay_does_not_repeat_reset():
     core, _, safety, _ = _build(reset_success=False)
     core.submit_command(_command(command_id='estop-1', task_id=6))
     reset = core.submit_command(
-        _command(command_id='reset-1', task_id=7)
+        _command(
+            command_id='reset-1', task_id=7, user_confirmed=True
+        )
     )
     assert reset.accepted
     safety.emit_reset_result()
@@ -665,7 +671,9 @@ def test_reset_failure_stays_latched_and_replay_does_not_repeat_reset():
     assert terminal.state is ExternalTaskState.FAILED
     before = len(safety.calls)
     replay = core.submit_command(
-        _command(command_id='reset-1', task_id=7)
+        _command(
+            command_id='reset-1', task_id=7, user_confirmed=True
+        )
     )
     assert replay.accepted
     assert len(safety.calls) == before

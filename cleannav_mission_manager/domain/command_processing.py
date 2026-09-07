@@ -56,6 +56,7 @@ class CommandReason(IntEnum):
     CONFIDENCE_TOO_LOW = 110
     FIELD_INVALID = 111
     NONFINITE_VALUE = 112
+    CONFIRMATION_REQUIRED = 115
     INTERNAL_SOURCE_FORBIDDEN_ON_HMI_TOPIC = 118
     COMMAND_TOO_LARGE = 124
 
@@ -99,6 +100,7 @@ class NormalizedTaskCommand:
     valid_for_ns: int
     confidence: float = 1.0
     raw_text: str = ''
+    user_confirmed: bool = False
 
 
 @dataclass(frozen=True)
@@ -131,6 +133,7 @@ class CommandSemanticFingerprint:
     source: int
     task_id: int
     valid_for_ns: int
+    user_confirmed: bool
 
 
 class DedupDecision(Enum):
@@ -162,6 +165,7 @@ def semantic_fingerprint(
         source=command.source,
         task_id=command.task_id,
         valid_for_ns=command.valid_for_ns,
+        user_confirmed=command.user_confirmed,
     )
 
 
@@ -300,6 +304,9 @@ class CommandValidator:
         if len(command.raw_text) > 512:
             return self._reject(CommandReason.COMMAND_TOO_LARGE)
 
+        if type(command.user_confirmed) is not bool:
+            return self._reject(CommandReason.FIELD_INVALID)
+
         if now_ros_ns > (
             command.stamp_ns + command.valid_for_ns
         ):
@@ -320,6 +327,9 @@ class CommandValidator:
 
         if command.source not in task.allowed_sources:
             return self._reject(CommandReason.SOURCE_NOT_ALLOWED)
+
+        if task.requires_confirmation and not command.user_confirmed:
+            return self._reject(CommandReason.CONFIRMATION_REQUIRED)
 
         threshold = self._min_confidence_by_source.get(
             command.source

@@ -110,6 +110,8 @@ def test_reason_codes_match_generated_task_status():
             TaskStatus.REASON_FIELD_INVALID,
         CommandReason.NONFINITE_VALUE:
             TaskStatus.REASON_NONFINITE_VALUE,
+        CommandReason.CONFIRMATION_REQUIRED:
+            TaskStatus.REASON_CONFIRMATION_REQUIRED,
         CommandReason.INTERNAL_SOURCE_FORBIDDEN_ON_HMI_TOPIC:
             TaskStatus.REASON_INTERNAL_SOURCE_FORBIDDEN_ON_HMI_TOPIC,
         CommandReason.COMMAND_TOO_LARGE:
@@ -257,6 +259,34 @@ def test_disabled_task_is_rejected():
     )
 
     assert result.reason_code is CommandReason.TASK_DISABLED
+
+
+def test_confirmation_is_required_by_catalog_policy():
+    result = _validator().validate(
+        _command(task_id=7, user_confirmed=False),
+        now_ros_ns=2_000_000_000,
+    )
+
+    assert not result.accepted
+    assert result.reason_code is CommandReason.CONFIRMATION_REQUIRED
+
+
+def test_confirmed_reset_is_accepted():
+    result = _validator().validate(
+        _command(task_id=7, user_confirmed=True),
+        now_ros_ns=2_000_000_000,
+    )
+
+    assert result.accepted
+
+
+def test_non_confirmation_task_accepts_false_confirmation():
+    result = _validator().validate(
+        _command(task_id=30, user_confirmed=False),
+        now_ros_ns=2_000_000_000,
+    )
+
+    assert result.accepted
 
 
 def test_source_not_allowed_by_catalog_is_rejected():
@@ -422,6 +452,7 @@ def test_same_command_id_and_same_semantics_is_replay():
         {'source': int(CommandSource.VOICE)},
         {'task_id': 2},
         {'valid_for_ns': 6_000_000_000},
+        {'user_confirmed': True},
     ],
 )
 def test_same_command_id_with_changed_semantics_is_conflict(
