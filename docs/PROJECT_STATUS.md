@@ -284,3 +284,17 @@ RETURN_HOME 不复用旧 execution_id。
 
 M1-3 开始采用 framework-first 原则：Mock Navigation Adapter 当前只冻结通用 submit / cancel / callback、generation identity 和确定性测试机制，不冻结具体 Task、工作模式、Perception 接入方式或 Navigation Goal 的业务结构。
 <!-- M1_3_FRAMEWORK_FIRST_STATUS_END -->
+
+<!-- SW_PER_2_VISUAL_TARGET_ROS_WIRING_STATUS_START -->
+## SW-PER-2 Visual Target ROS Wiring
+
+已完成并通过静态/单元验证：
+
+- `MissionManagerNode` 默认仍使用 Mock runtime；真实视觉 runtime 必须显式注入 `cleaning_target_topic`。
+- localization 默认输入为 `/rtabmap/localization_pose`，支持测试覆盖。
+- `VisualTargetRosBridge` 将 `CleaningTargetArray` 复用既有 conversion/registry，将合法 `PoseWithCovarianceStamped` 缓存为最新 `map` pose，并复用 Core 的 WAITING_TARGET retry/timeout API。
+- 已验证非法 pose/target 输入不会覆盖合法状态，也不会清空 Registry；无输入时 timer 仍由 Core 负责 timeout。
+- 验证结果：full unit `494 passed`；copyright/flake8/pep257 `2 passed, 1 skipped`；目标文件 py_compile 通过。
+
+本阶段没有验证真实 perception publisher、Nav2、Safety Supervisor、Gazebo 或完整视觉联调；CleaningTargetArray 的生产 topic 仍由调用方显式提供。
+<!-- SW_PER_2_VISUAL_TARGET_ROS_WIRING_STATUS_END -->

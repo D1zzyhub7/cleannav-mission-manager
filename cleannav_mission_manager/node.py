@@ -60,6 +60,16 @@ from cleannav_mission_manager.ros_conversion import (
     ros_task_command_to_normalized,
     status_snapshot_to_ros,
 )
+from cleannav_mission_manager.domain.target_registry import TargetRegistry
+from cleannav_mission_manager.domain.target_selector import TargetSelector
+from cleannav_mission_manager.visual_target_goal_resolver import (
+    VisualTargetGoalResolver,
+)
+from cleannav_mission_manager.visual_target_ros_bridge import (
+    LOCALIZATION_TOPIC,
+    LatestRobotPoseProvider,
+    VisualTargetRosBridge,
+)
 
 
 TASK_COMMAND_TOPIC = '/cleannav/hmi/task_command'
@@ -115,6 +125,9 @@ class MissionManagerNode(Node):
         self._command_store: CommandRecordStore | None = None
         self._execution_store: ExecutionRecordStore | None = None
         self._last_command_id: str | None = None
+        self._visual_target_bridge: VisualTargetRosBridge | None = None
+        self._visual_target_registry: TargetRegistry | None = None
+        self._visual_target_pose_provider: LatestRobotPoseProvider | None = None
 
         self._task_command_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -227,6 +240,54 @@ class MissionManagerNode(Node):
             goal_resolver=goal_resolver,
         )
 
+    def create_visual_real_runtime(
+        self,
+        *,
+        cleaning_target_topic: str,
+        localization_topic: str = LOCALIZATION_TOPIC,
+    ) -> RuntimeComposition:
+        """Build the real runtime and explicit visual ROS input bridge."""
+        if not isinstance(cleaning_target_topic, str):
+            raise TypeError('cleaning_target_topic must be str')
+        if not cleaning_target_topic.strip():
+            raise ValueError('cleaning_target_topic must be non-empty')
+        if not isinstance(localization_topic, str):
+            raise TypeError('localization_topic must be str')
+        if not localization_topic.strip():
+            raise ValueError('localization_topic must be non-empty')
+
+        registry = TargetRegistry()
+        pose_provider = LatestRobotPoseProvider()
+        selector = TargetSelector(registry)
+        resolver = VisualTargetGoalResolver(
+            registry=registry,
+            selector=selector,
+            robot_pose_provider=pose_provider,
+            now_ros_ns=self._now_ros_ns,
+        )
+        runtime = self.create_real_runtime(resolver)
+        self._visual_target_registry = registry
+        self._visual_target_pose_provider = pose_provider
+        self._visual_target_bridge = VisualTargetRosBridge(
+            node=self,
+            core=runtime.core,
+            registry=registry,
+            pose_provider=pose_provider,
+            cleaning_target_topic=cleaning_target_topic,
+            localization_topic=localization_topic,
+            on_core_result=self._publish_active_runtime_status,
+        )
+        return runtime
+
+    @property
+    def visual_target_bridge(self) -> VisualTargetRosBridge | None:
+        """Return the explicit visual runtime bridge, when configured."""
+        return self._visual_target_bridge
+
+    def _now_ros_ns(self) -> int:
+        """Return current ROS time in integer nanoseconds."""
+        return int(self.get_clock().now().nanoseconds)
+
     def _create_runtime(
         self,
         *,
@@ -326,6 +387,20 @@ class MissionManagerNode(Node):
             return None
         record = self._execution_store.get(execution_id)
         return record.command_id if record is not None else None
+
+    def _publish_active_runtime_status(self, result: object) -> None:
+        """Publish status after a visual bridge Core entry point returns."""
+        execution_id = getattr(result, 'execution_id', None)
+        if execution_id is None:
+            active_execution = getattr(self._core, 'active_execution', None)
+            if active_execution is not None:
+                execution_id = active_execution.execution_id
+        if execution_id is None:
+            return
+        self._publish_latest_status(
+            command_id=self._command_id_for_execution(execution_id),
+            execution_id=execution_id,
+        )
 
     def _publish_latest_status(
         self,
