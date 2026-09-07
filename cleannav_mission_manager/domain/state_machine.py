@@ -56,6 +56,8 @@ class StateMachineEvent(Enum):
     """Execution lifecycle events supported by the pure state machine."""
 
     GOAL_PREPARED = 'GOAL_PREPARED'
+    TARGET_NOT_READY = 'TARGET_NOT_READY'
+    TARGET_WAIT_TIMEOUT = 'TARGET_WAIT_TIMEOUT'
     NAV_GOAL_ACCEPTED = 'NAV_GOAL_ACCEPTED'
     NAV_GOAL_REJECTED = 'NAV_GOAL_REJECTED'
     LEASE_ACQUIRED = 'LEASE_ACQUIRED'
@@ -83,6 +85,7 @@ class TransitionEffect(Enum):
     RELEASE_LEASE = 'RELEASE_LEASE'
     TERMINAL_SUCCEEDED = 'TERMINAL_SUCCEEDED'
     TERMINAL_FAILED = 'TERMINAL_FAILED'
+    TERMINAL_TARGET_WAIT_TIMEOUT = 'TERMINAL_TARGET_WAIT_TIMEOUT'
     CANCEL_NAVIGATION = 'CANCEL_NAVIGATION'
     ADVANCE_GENERATION = 'ADVANCE_GENERATION'
     TERMINAL_CANCELED = 'TERMINAL_CANCELED'
@@ -647,6 +650,40 @@ def transition(
             )
 
         return _rejected(context)
+
+    if state is InternalExecutionState.WAITING_TARGET:
+        if event is StateMachineEvent.TARGET_WAIT_TIMEOUT:
+            return _decision(
+                context,
+                _clean_context(InternalExecutionState.IDLE),
+                TransitionEffect.TERMINAL_TARGET_WAIT_TIMEOUT,
+            )
+        if event is StateMachineEvent.GOAL_PREPARED:
+            cleanup = replace(
+                context.cleanup,
+                navigation_submitted=True,
+            )
+            return _decision(
+                context,
+                replace(
+                    context,
+                    state=InternalExecutionState.NAVIGATION_STARTING,
+                    cleanup=cleanup,
+                ),
+                TransitionEffect.SUBMIT_NAVIGATION,
+            )
+
+    if (
+        state is InternalExecutionState.PREPARING_GOAL
+        and event is StateMachineEvent.TARGET_NOT_READY
+    ):
+        return _decision(
+            context,
+            replace(
+                context,
+                state=InternalExecutionState.WAITING_TARGET,
+            ),
+        )
 
     if (
         state is InternalExecutionState.PREPARING_GOAL

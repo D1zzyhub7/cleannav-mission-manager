@@ -16,6 +16,11 @@ from cleannav_mission_manager.domain.command_processing import (
     TaskCatalogEntry,
     TaskKind,
 )
+from cleannav_mission_manager.domain.target_models import (
+    TargetSelectionRule,
+    TargetType,
+    VisualTargetPolicy,
+)
 
 
 _EXPECTED_RANGES = {
@@ -40,6 +45,20 @@ _REQUIRED_TASK_KEYS = {
     'allowed_sources',
     'requires_confirmation',
     'description',
+}
+
+_VISUAL_TASK_FIELDS = {
+    'target_type',
+    'selection_rule',
+    'wait_timeout_sec',
+    'completion_radius_m',
+}
+
+_TARGET_TYPE_NAME_TO_VALUE = {
+    'LEAF': TargetType.LEAF,
+    'LEAF_PILE': TargetType.LEAF_PILE,
+    'PUDDLE': TargetType.PUDDLE,
+    'ANY': TargetType.ANY,
 }
 
 
@@ -209,6 +228,38 @@ def _parse_task(raw_task: object) -> TaskCatalogEntry:
     if not isinstance(description, str):
         _raise_invalid('description must be a string')
 
+    visual_target_policy = None
+    if 30 <= task_id <= 39:
+        missing_visual = _VISUAL_TASK_FIELDS - set(raw_task)
+        if missing_visual:
+            _raise_invalid(
+                'visual task missing required policy keys: '
+                + ', '.join(sorted(missing_visual))
+            )
+
+        raw_target_type = raw_task['target_type']
+        if (
+            not isinstance(raw_target_type, str)
+            or raw_target_type not in _TARGET_TYPE_NAME_TO_VALUE
+        ):
+            _raise_invalid(
+                f'unsupported visual target_type: {raw_target_type}'
+            )
+
+        try:
+            visual_target_policy = VisualTargetPolicy(
+                target_type=_TARGET_TYPE_NAME_TO_VALUE[raw_target_type],
+                selection_rule=TargetSelectionRule(
+                    raw_task['selection_rule']
+                ),
+                wait_timeout_sec=raw_task['wait_timeout_sec'],
+                completion_radius_m=raw_task['completion_radius_m'],
+            )
+        except (TypeError, ValueError) as exc:
+            _raise_invalid(
+                f'invalid visual target policy: {exc}'
+            )
+
     return TaskCatalogEntry(
         task_id=task_id,
         name=name,
@@ -216,6 +267,7 @@ def _parse_task(raw_task: object) -> TaskCatalogEntry:
         enabled=enabled,
         allowed_sources=frozenset(sources),
         requires_confirmation=requires_confirmation,
+        visual_target_policy=visual_target_policy,
     )
 
 

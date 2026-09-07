@@ -37,6 +37,10 @@ from cleannav_mission_manager.domain.generation_gate import (
     GenerationGate,
     GenerationHandle,
 )
+from cleannav_mission_manager.domain.goal_resolution import (
+    PendingGoal,
+    ResolvedGoal,
+)
 from cleannav_mission_manager.domain.mission_queue import (
     MissionQueue,
     QueuedMission,
@@ -57,14 +61,14 @@ from cleannav_mission_manager.domain.state_machine import (
 
 
 class GoalResolver(Protocol):
-    """Resolve one validated mission into an opaque navigation payload."""
+    """Resolve one mission into a goal, or explicitly remain pending."""
 
     def __call__(
         self,
         command: NormalizedTaskCommand,
         task: TaskCatalogEntry,
     ) -> object:
-        """Return a navigation payload without exposing its structure."""
+        """Return an object, ResolvedGoal, or PendingGoal."""
         ...
 
 
@@ -135,6 +139,7 @@ class MissionManagerCore:
         self._active_context: Optional[StateMachineContext] = None
         self._active_mission: Optional[QueuedMission] = None
         self._active_goal: object | None = None
+        self._target_wait_deadline_ros_ns: int | None = None
         self._manager_mode = ManagerMode.NORMAL
         self._pending_reset_command: Optional[NormalizedTaskCommand] = None
 
@@ -162,6 +167,17 @@ class MissionManagerCore:
     def manager_mode(self) -> ManagerMode:
         """Return the current manager-level mode."""
         return self._manager_mode
+
+    @property
+    def active_target_id(self) -> str:
+        """Return the target frozen for the active execution, if any."""
+        record = self.active_execution
+        return record.active_target_id if record is not None else ''
+
+    @property
+    def target_wait_deadline_ros_ns(self) -> int | None:
+        """Return the first target-wait deadline, if currently applicable."""
+        return self._target_wait_deadline_ros_ns
 
     def submit_command(
         self,
@@ -544,25 +560,153 @@ class MissionManagerCore:
         raise ValueError('unsupported SafetyEventType')
 
     def _prepare_and_submit_current_goal(self) -> None:
-        """Resolve and submit the next goal for the current generation."""
+        """Reuse a frozen goal or resolve the current mission once."""
         if self._active_mission is None:
             raise GoalResolutionError(
                 'current execution has no mission context'
             )
-        goal = self._goal_resolver(
-            self._active_mission.command,
-            self._active_mission.task,
-        )
-        if goal is None:
-            raise GoalResolutionError(
-                'goal resolver returned None for current mission'
+
+        if self._active_goal is None:
+            resolution = self._resolve_goal(
+                self._active_mission.command,
+                self._active_mission.task,
             )
-        self._active_goal = goal
+            if isinstance(resolution, PendingGoal):
+                result = self._apply_event(
+                    StateMachineEvent.TARGET_NOT_READY
+                )
+                if not result.accepted:
+                    raise RuntimeError(
+                        'State Machine rejected pending target resolution'
+                    )
+                return
+            self._freeze_goal(resolution)
+
         result = self._apply_event(StateMachineEvent.GOAL_PREPARED)
         if not result.accepted:
             raise RuntimeError(
                 'State Machine rejected prepared resumed goal'
             )
+
+    def _resolve_goal(
+        self,
+        command: NormalizedTaskCommand,
+        task: TaskCatalogEntry,
+    ) -> ResolvedGoal | PendingGoal:
+        """Normalize legacy resolver payloads into the new result contract."""
+        result = self._goal_resolver(command, task)
+        if isinstance(result, PendingGoal):
+            return result
+        if isinstance(result, ResolvedGoal):
+            return result
+        if result is None:
+            raise GoalResolutionError(
+                'goal resolver returned None for current mission'
+            )
+        return ResolvedGoal(payload=result)
+
+    def _freeze_goal(self, resolution: ResolvedGoal) -> None:
+        """Freeze payload and target identity for this execution."""
+        if not isinstance(resolution, ResolvedGoal):
+            raise TypeError('resolution must be ResolvedGoal')
+        self._active_goal = resolution.payload
+        record = self.active_execution
+        if record is None:
+            raise GoalResolutionError(
+                'cannot freeze a goal without an active execution'
+            )
+        if (
+            record.active_target_id != ''
+            and record.active_target_id != resolution.active_target_id
+        ):
+            raise GoalResolutionError(
+                'active target identity changed during one execution'
+            )
+        if resolution.active_target_id != '':
+            result = self._execution_store.update(
+                record.execution_id,
+                active_target_id=resolution.active_target_id,
+            )
+            if not result.updated:
+                raise RuntimeError(
+                    'Execution Store rejected active target freeze: '
+                    f'{result.reason_code.name}'
+                )
+
+    def retry_waiting_goal_resolution(self) -> CoreResult:
+        """Retry only an active WAITING_TARGET execution."""
+        if (
+            self._active_context is None
+            or self._active_context.state
+            is not InternalExecutionState.WAITING_TARGET
+            or self._active_mission is None
+            or self.active_execution is None
+        ):
+            return CoreResult(
+                accepted=False,
+                reason_code=CommandReason.ACTIVE_EXECUTION_CONFLICT,
+                message='no active WAITING_TARGET execution',
+            )
+
+        timeout_result = self.check_target_wait_timeout()
+        if timeout_result.reason_code is CommandReason.TARGET_WAIT_TIMEOUT:
+            return timeout_result
+
+        resolution = self._resolve_goal(
+            self._active_mission.command,
+            self._active_mission.task,
+        )
+        if isinstance(resolution, PendingGoal):
+            return CoreResult(
+                accepted=True,
+                reason_code=CommandReason.WAITING_FOR_TARGET,
+                execution_id=self.active_execution.execution_id,
+                message='still waiting for a valid target',
+            )
+
+        self._freeze_goal(resolution)
+        return self._apply_event(StateMachineEvent.GOAL_PREPARED)
+
+    def check_target_wait_timeout(self) -> CoreResult:
+        """Terminalize WAITING_TARGET after its original deadline."""
+        if (
+            self._active_context is None
+            or self._active_context.state
+            is not InternalExecutionState.WAITING_TARGET
+            or self.active_execution is None
+        ):
+            return CoreResult(
+                accepted=False,
+                reason_code=CommandReason.ACTIVE_EXECUTION_CONFLICT,
+                message='no active WAITING_TARGET execution',
+            )
+
+        deadline = self._target_wait_deadline_ros_ns
+        if deadline is None or self._now_ros_ns() < deadline:
+            return CoreResult(
+                accepted=True,
+                reason_code=CommandReason.WAITING_FOR_TARGET,
+                execution_id=self.active_execution.execution_id,
+                message='target wait is still within its deadline',
+            )
+
+        result = self._apply_event(
+            StateMachineEvent.TARGET_WAIT_TIMEOUT
+        )
+        return CoreResult(
+            accepted=result.accepted,
+            reason_code=CommandReason.TARGET_WAIT_TIMEOUT,
+            execution_id=result.execution_id,
+            message='target wait timeout',
+        )
+
+    def tick(self) -> CoreResult:
+        """Poll the Core timeout boundary without ROS timer ownership."""
+        return self.check_target_wait_timeout()
+
+    def check_timeout(self) -> CoreResult:
+        """Alias for callers using a generic Core timeout poll."""
+        return self.check_target_wait_timeout()
 
     def _activate_next(self) -> None:
         """Activate at most one queued mission and submit its first goal."""
@@ -574,11 +718,7 @@ class MissionManagerCore:
         if queued is None:
             return
 
-        goal = self._goal_resolver(queued.command, queued.task)
-        if goal is None:
-            raise GoalResolutionError(
-                'goal resolver returned None for queued mission'
-            )
+        resolution = self._resolve_goal(queued.command, queued.task)
 
         popped = self._mission_queue.pop_next(now_ros_ns=now_ros_ns)
         if popped.item is None:
@@ -586,9 +726,14 @@ class MissionManagerCore:
         if popped.item.command.command_id != queued.command.command_id:
             raise RuntimeError('queue head changed during activation')
 
+        initial_state = (
+            InternalExecutionState.WAITING_TARGET
+            if isinstance(resolution, PendingGoal)
+            else InternalExecutionState.PREPARING_GOAL
+        )
         activation = self._execution_store.activate(
             popped.item.command,
-            initial_state=InternalExecutionState.PREPARING_GOAL,
+            initial_state=initial_state,
         )
         if not activation.created or activation.record is None:
             raise RuntimeError(
@@ -598,9 +743,16 @@ class MissionManagerCore:
 
         record = activation.record
         self._active_mission = popped.item
-        self._active_goal = goal
+        self._active_goal = None
+        self._target_wait_deadline_ros_ns = None
+        if isinstance(resolution, PendingGoal):
+            self._target_wait_deadline_ros_ns = (
+                now_ros_ns + resolution.wait_timeout_ns
+            )
+        else:
+            self._freeze_goal(resolution)
         self._active_context = StateMachineContext(
-            state=InternalExecutionState.PREPARING_GOAL
+            state=initial_state
         )
         self._command_store.update_record(
             record.command_id,
@@ -611,16 +763,34 @@ class MissionManagerCore:
         self._write_command_status(
             popped.item.command,
             execution_id=record.execution_id,
-            state=ExternalTaskState.PREPARING,
-            reason_code=CommandReason.EXECUTION_ACTIVATED,
+            state=(
+                ExternalTaskState.WAITING_TARGET
+                if isinstance(resolution, PendingGoal)
+                else ExternalTaskState.PREPARING
+            ),
+            reason_code=(
+                CommandReason.WAITING_FOR_TARGET
+                if isinstance(resolution, PendingGoal)
+                else CommandReason.EXECUTION_ACTIVATED
+            ),
+            active_target_id=record.active_target_id,
         )
         self._write_execution_status(
             record,
-            state=ExternalTaskState.PREPARING,
-            reason_code=CommandReason.EXECUTION_ACTIVATED,
+            state=(
+                ExternalTaskState.WAITING_TARGET
+                if isinstance(resolution, PendingGoal)
+                else ExternalTaskState.PREPARING
+            ),
+            reason_code=(
+                CommandReason.WAITING_FOR_TARGET
+                if isinstance(resolution, PendingGoal)
+                else CommandReason.EXECUTION_ACTIVATED
+            ),
         )
 
-        self._apply_event(StateMachineEvent.GOAL_PREPARED)
+        if not isinstance(resolution, PendingGoal):
+            self._apply_event(StateMachineEvent.GOAL_PREPARED)
 
     def _apply_event(self, event: StateMachineEvent) -> CoreResult:
         """Apply one domain event, then execute all emitted effects."""
@@ -758,6 +928,14 @@ class MissionManagerCore:
             )
             return
 
+        if effect is TransitionEffect.TERMINAL_TARGET_WAIT_TIMEOUT:
+            self._finish_execution(
+                record,
+                ExternalTaskState.FAILED,
+                reason_code=CommandReason.TARGET_WAIT_TIMEOUT,
+            )
+            return
+
         if effect is TransitionEffect.TERMINAL_CANCELED:
             self._finish_execution(
                 record,
@@ -782,6 +960,7 @@ class MissionManagerCore:
         self,
         record: ExecutionRecord,
         state: ExternalTaskState,
+        reason_code: CommandReason = CommandReason.NONE,
     ) -> None:
         """Persist terminal status, retire navigation, activate FIFO next."""
         if (
@@ -795,7 +974,7 @@ class MissionManagerCore:
         self._write_execution_status(
             record,
             state=state,
-            reason_code=CommandReason.NONE,
+            reason_code=reason_code,
         )
         command = self._active_mission.command
         self._command_store.update_record(
@@ -807,7 +986,8 @@ class MissionManagerCore:
             command,
             execution_id=record.execution_id,
             state=state,
-            reason_code=CommandReason.NONE,
+            reason_code=reason_code,
+            active_target_id=record.active_target_id,
         )
         handle = self._generation_gate.active_handle
         if handle is not None and handle.execution_id == record.execution_id:
@@ -818,6 +998,7 @@ class MissionManagerCore:
         self._active_context = None
         self._active_mission = None
         self._active_goal = None
+        self._target_wait_deadline_ros_ns = None
         if self._manager_mode is ManagerMode.EMERGENCY_LATCHED:
             self._active_context = StateMachineContext(
                 state=InternalExecutionState.IDLE,
@@ -867,6 +1048,7 @@ class MissionManagerCore:
                 execution_id=record.execution_id,
                 state=state,
                 reason_code=CommandReason.NONE,
+                active_target_id=record.active_target_id,
             )
 
     def _write_execution_status(
@@ -884,6 +1066,7 @@ class MissionManagerCore:
             task_id=record.task_id,
             status_scope=StatusScope.EXECUTION,
             state=state,
+            active_target_id=record.active_target_id,
             reason_code=int(reason_code),
         )
         result = self._execution_store.write_status(snapshot)
@@ -899,6 +1082,7 @@ class MissionManagerCore:
         execution_id: str,
         state: ExternalTaskState,
         reason_code: CommandReason,
+        active_target_id: str = '',
     ) -> None:
         snapshot = StatusSnapshot(
             stamp_ns=self._now_ros_ns(),
@@ -908,6 +1092,7 @@ class MissionManagerCore:
             task_id=command.task_id,
             status_scope=StatusScope.COMMAND,
             state=state,
+            active_target_id=active_target_id,
             reason_code=int(reason_code),
         )
         result = self._command_store.write_command_status(snapshot)
@@ -921,6 +1106,8 @@ class MissionManagerCore:
         state: InternalExecutionState,
     ) -> Optional[ExternalTaskState]:
         mapping = {
+            InternalExecutionState.WAITING_TARGET:
+                ExternalTaskState.WAITING_TARGET,
             InternalExecutionState.PREPARING_GOAL:
                 ExternalTaskState.PREPARING,
             InternalExecutionState.NAVIGATION_STARTING:

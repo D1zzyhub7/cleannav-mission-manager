@@ -8,6 +8,10 @@ import math
 import re
 from typing import Mapping, Optional
 
+from cleannav_mission_manager.domain.target_models import (
+    VisualTargetPolicy,
+)
+
 
 _COMMAND_ID_PATTERN = re.compile(r'[A-Za-z0-9._:-]+')
 
@@ -55,6 +59,8 @@ class CommandReason(IntEnum):
     INTERNAL_SOURCE_FORBIDDEN_ON_HMI_TOPIC = 118
     COMMAND_TOO_LARGE = 124
 
+    WAITING_FOR_TARGET = 8
+
     QUEUE_FULL = 200
     TASK_CATALOG_UNAVAILABLE = 201
     TASK_CATALOG_INVALID = 202
@@ -64,6 +70,8 @@ class CommandReason(IntEnum):
     NAV_CONCURRENT_GENERATION_FORBIDDEN = 417
 
     TIMESTAMP_INVALID = 609
+
+    TARGET_WAIT_TIMEOUT = 305
 
     ACTIVE_EXECUTION_CONFLICT = 706
     ACTIVE_GENERATION_CONFLICT = 707
@@ -103,6 +111,7 @@ class TaskCatalogEntry:
     enabled: bool
     allowed_sources: frozenset[int]
     requires_confirmation: bool = False
+    visual_target_policy: Optional[VisualTargetPolicy] = None
 
 
 @dataclass(frozen=True)

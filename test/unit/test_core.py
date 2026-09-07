@@ -523,7 +523,7 @@ def test_resume_preserves_execution_advances_generation_and_resubmits():
     assert core.active_execution.generation == 2
     assert len(navigation.submitted_calls) == 2
     assert navigation.submitted_calls[-1].handle == new_handle
-    assert goals == [('command-1', 30), ('command-1', 30)]
+    assert goals == [('command-1', 30)]
 
     for stale_type in (
         NavigationEventType.GOAL_ACCEPTED,
