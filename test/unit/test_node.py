@@ -245,6 +245,32 @@ def test_disabled_task_rejection_is_returned_by_core():
         node.destroy_node()
 
 
+def test_unconfirmed_reset_publishes_ephemeral_rejected_command_status():
+    node = _node()
+    published = []
+    node._publish_status_message = published.append
+    try:
+        result = node._on_task_command(
+            _command(node, task_id=7)
+        )
+
+        assert result is not None
+        assert not result.accepted
+        assert result.reason_code is CommandReason.CONFIRMATION_REQUIRED
+        assert len(published) == 1
+        status = published[0]
+        assert status.status_scope == TaskStatus.SCOPE_COMMAND
+        assert status.state == TaskStatus.STATE_REJECTED
+        assert status.reason_code == 115
+        assert status.command_id == 'command-7'
+        assert status.task_id == 7
+        assert status.execution_id == ''
+        assert node.runtime is not None
+        assert node.runtime.command_store.get_record('command-7') is None
+    finally:
+        node.destroy_node()
+
+
 def test_task_status_is_published_from_current_store_snapshots():
     node = _node()
     published = []

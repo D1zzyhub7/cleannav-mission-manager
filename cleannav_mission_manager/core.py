@@ -88,6 +88,7 @@ class CoreResult:
     reason_code: CommandReason
     execution_id: Optional[str] = None
     replay_status: Optional[StatusSnapshot] = None
+    status_snapshot: Optional[StatusSnapshot] = None
     stale: bool = False
     supported: bool = True
     message: str = ''
@@ -195,6 +196,12 @@ class MissionManagerCore:
             return CoreResult(
                 accepted=False,
                 reason_code=validation.reason_code,
+                status_snapshot=self._make_command_scope_status(
+                    command,
+                    state=ExternalTaskState.REJECTED,
+                    reason_code=validation.reason_code,
+                    message='command validation rejected',
+                ),
             )
 
         registration = self._command_store.register_or_replay(
@@ -1084,7 +1091,31 @@ class MissionManagerCore:
         reason_code: CommandReason,
         active_target_id: str = '',
     ) -> None:
-        snapshot = StatusSnapshot(
+        snapshot = self._make_command_scope_status(
+            command,
+            state=state,
+            reason_code=reason_code,
+            execution_id=execution_id,
+            active_target_id=active_target_id,
+        )
+        result = self._command_store.write_command_status(snapshot)
+        if not result.written:
+            raise RuntimeError(
+                f'Command status write failed: {result.reason_code.name}'
+            )
+
+    def _make_command_scope_status(
+        self,
+        command: NormalizedTaskCommand,
+        *,
+        state: ExternalTaskState,
+        reason_code: CommandReason,
+        execution_id: str = '',
+        active_target_id: str = '',
+        message: str = '',
+    ) -> StatusSnapshot:
+        """Build a command status without persisting it in CommandStore."""
+        return StatusSnapshot(
             stamp_ns=self._now_ros_ns(),
             interface_version=command.interface_version,
             execution_id=execution_id,
@@ -1094,12 +1125,8 @@ class MissionManagerCore:
             state=state,
             active_target_id=active_target_id,
             reason_code=int(reason_code),
+            message=message,
         )
-        result = self._command_store.write_command_status(snapshot)
-        if not result.written:
-            raise RuntimeError(
-                f'Command status write failed: {result.reason_code.name}'
-            )
 
     @staticmethod
     def _external_state(

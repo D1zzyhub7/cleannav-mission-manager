@@ -35,6 +35,7 @@ from cleannav_mission_manager.domain.command_processing import (
 from cleannav_mission_manager.domain.command_store import (
     CommandRecordStore,
     ExternalTaskState,
+    StatusScope,
     TerminalStatusCache,
 )
 from cleannav_mission_manager.domain.execution_store import (
@@ -263,6 +264,37 @@ def test_existing_validator_and_catalog_reject_invalid_mission(
     assert core.active_execution is None
     assert core.queued_missions == ()
     assert navigation.submitted_calls == ()
+    assert goals == []
+
+
+def test_validation_rejection_returns_ephemeral_command_status_without_storage():
+    core, navigation, safety, goals = _build()
+
+    result = core.submit_command(
+        _command(
+            command_id='reset-unconfirmed',
+            task_id=7,
+            user_confirmed=False,
+        )
+    )
+
+    assert not result.accepted
+    assert result.reason_code is CommandReason.CONFIRMATION_REQUIRED
+    assert result.status_snapshot is not None
+    assert result.status_snapshot.status_scope is StatusScope.COMMAND
+    assert result.status_snapshot.state is ExternalTaskState.REJECTED
+    assert result.status_snapshot.command_id == 'reset-unconfirmed'
+    assert result.status_snapshot.task_id == 7
+    assert result.status_snapshot.execution_id == ''
+    assert result.status_snapshot.reason_code == 115
+    assert core._command_store.get_record('reset-unconfirmed') is None
+    assert core._command_store.get_current_command_status(
+        'reset-unconfirmed'
+    ) is None
+    assert core.active_execution is None
+    assert core.queued_missions == ()
+    assert navigation.submitted_calls == ()
+    assert safety.calls == ()
     assert goals == []
 
 

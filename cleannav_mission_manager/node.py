@@ -350,10 +350,16 @@ class MissionManagerNode(Node):
 
         self._last_command_id = command.command_id
         result = self._core.submit_command(command)
-        self._publish_latest_status(
-            command_id=command.command_id,
-            execution_id=getattr(result, 'execution_id', None),
-        )
+        immediate_status = getattr(result, 'status_snapshot', None)
+        if immediate_status is not None:
+            self._publish_status_message(
+                status_snapshot_to_ros(immediate_status)
+            )
+        else:
+            self._publish_latest_status(
+                command_id=command.command_id,
+                execution_id=getattr(result, 'execution_id', None),
+            )
         return result
 
     def _on_navigation_event(self, event: NavigationEvent) -> CoreResult:
