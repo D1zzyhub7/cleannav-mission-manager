@@ -54,6 +54,9 @@ from cleannav_mission_manager.domain.execution_store import (
 )
 from cleannav_mission_manager.domain.generation_gate import GenerationGate
 from cleannav_mission_manager.domain.mission_queue import MissionQueue
+from cleannav_mission_manager.domain.runtime_policy import (
+    MIN_CONFIDENCE_BY_SOURCE,
+)
 from cleannav_mission_manager.domain.task_catalog import load_task_catalog
 from cleannav_mission_manager.ros_conversion import (
     RosConversionError,
@@ -127,7 +130,9 @@ class MissionManagerNode(Node):
         self._last_command_id: str | None = None
         self._visual_target_bridge: VisualTargetRosBridge | None = None
         self._visual_target_registry: TargetRegistry | None = None
-        self._visual_target_pose_provider: LatestRobotPoseProvider | None = None
+        self._visual_target_pose_provider: (
+            LatestRobotPoseProvider | None
+        ) = None
 
         self._task_command_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -317,7 +322,9 @@ class MissionManagerNode(Node):
             terminal_cache=TerminalStatusCache(32),
         )
         core = MissionManagerCore(
-            validator=catalog.make_validator(),
+            validator=catalog.make_validator(
+                min_confidence_by_source=MIN_CONFIDENCE_BY_SOURCE,
+            ),
             command_store=command_store,
             mission_queue=MissionQueue(32),
             execution_store=execution_store,

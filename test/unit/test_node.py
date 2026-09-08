@@ -30,6 +30,7 @@ from cleannav_mission_manager.adapters.real_safety import RealSafetyAdapter
 from cleannav_mission_manager.core import CoreResult
 from cleannav_mission_manager.domain.command_processing import (
     CommandReason,
+    CommandSource,
     NormalizedTaskCommand,
 )
 from cleannav_mission_manager.domain.command_store import CommandRecordStore
@@ -39,6 +40,10 @@ from cleannav_mission_manager.domain.execution_store import (
 from cleannav_mission_manager.domain.generation_gate import GenerationGate
 from cleannav_mission_manager.domain.mission_queue import MissionQueue
 from cleannav_mission_manager.node import MissionManagerNode
+from cleannav_mission_manager.domain.runtime_policy import (
+    MIN_CONFIDENCE_BY_SOURCE,
+    VOICE_MIN_CONFIDENCE,
+)
 
 
 @pytest.fixture(scope='module', autouse=True)
@@ -51,15 +56,23 @@ def ros_context():
         rclpy.shutdown()
 
 
-def _command(node, *, task_id=30, frame_id=''):
+def _command(
+    node,
+    *,
+    task_id=30,
+    frame_id='',
+    source=TaskCommand.SOURCE_APP,
+    confidence=1.0,
+    command_id=None,
+):
     message = TaskCommand()
     message.header.stamp = node.get_clock().now().to_msg()
     message.header.frame_id = frame_id
     message.interface_version = '1.0'
-    message.command_id = f'command-{task_id}'
-    message.source = TaskCommand.SOURCE_APP
+    message.command_id = command_id or f'command-{task_id}'
+    message.source = source
     message.task_id = task_id
-    message.confidence = 1.0
+    message.confidence = confidence
     message.raw_text = 'mock command'
     message.valid_for.sec = 60
     return message
@@ -112,6 +125,21 @@ def test_node_name_and_explicit_mock_runtime():
         node.destroy_node()
 
 
+def test_default_runtime_composition_contains_voice_threshold_policy():
+    node = _node()
+    try:
+        assert MIN_CONFIDENCE_BY_SOURCE == {
+            int(CommandSource.VOICE): VOICE_MIN_CONFIDENCE,
+        }
+        assert node.runtime is not None
+        validator = node.runtime.core._validator
+        assert validator._min_confidence_by_source == {
+            int(CommandSource.VOICE): 0.80,
+        }
+    finally:
+        node.destroy_node()
+
+
 def test_explicit_real_runtime_wires_real_adapters_and_injected_resolver():
     def resolver(command, task):
         pose = PoseStamped()
@@ -155,6 +183,9 @@ def test_real_runtime_uses_common_stores_and_preserves_execution_id_factory():
         assert isinstance(runtime.core._mission_queue, MissionQueue)
         assert isinstance(runtime.core._generation_gate, GenerationGate)
         assert runtime.execution_store._id_factory() == 'ros-execution-1'
+        assert runtime.core._validator._min_confidence_by_source == {
+            int(CommandSource.VOICE): VOICE_MIN_CONFIDENCE,
+        }
     finally:
         node.destroy_node()
 
@@ -241,6 +272,124 @@ def test_disabled_task_rejection_is_returned_by_core():
         assert result is not None
         assert not result.accepted
         assert result.reason_code is CommandReason.TASK_DISABLED
+    finally:
+        node.destroy_node()
+
+
+def test_low_confidence_voice_is_rejected_without_runtime_side_effects():
+    node = _node()
+    published = []
+    node._publish_status_message = published.append
+    try:
+        result = node._on_task_command(
+            _command(
+                node,
+                source=TaskCommand.SOURCE_VOICE,
+                confidence=0.79,
+                command_id='voice-low-confidence',
+            )
+        )
+
+        assert result is not None
+        assert not result.accepted
+        assert result.reason_code is CommandReason.CONFIDENCE_TOO_LOW
+        assert len(published) == 1
+        assert published[0].status_scope == TaskStatus.SCOPE_COMMAND
+        assert published[0].state == TaskStatus.STATE_REJECTED
+        assert published[0].reason_code == (
+            TaskStatus.REASON_CONFIDENCE_TOO_LOW
+        )
+        assert published[0].command_id == 'voice-low-confidence'
+
+        runtime = node.runtime
+        assert runtime is not None
+        assert runtime.command_store.get_record(
+            'voice-low-confidence'
+        ) is None
+        assert runtime.execution_store.get_active() is None
+        assert runtime.core.queued_missions == ()
+        assert runtime.navigation.submitted_calls == ()
+        assert runtime.safety.calls == ()
+    finally:
+        node.destroy_node()
+
+
+@pytest.mark.parametrize('confidence', [0.80, 1.0])
+def test_voice_confidence_boundary_is_admitted_by_default_runtime(
+    confidence,
+):
+    node = _node()
+    try:
+        result = node._on_task_command(
+            _command(
+                node,
+                source=TaskCommand.SOURCE_VOICE,
+                confidence=confidence,
+                command_id=f'voice-confidence-{confidence}',
+            )
+        )
+
+        assert result is not None
+        assert result.accepted
+        assert result.reason_code is not CommandReason.CONFIDENCE_TOO_LOW
+    finally:
+        node.destroy_node()
+
+
+def test_app_low_confidence_is_not_rejected_by_voice_threshold():
+    node = _node()
+    try:
+        result = node._on_task_command(
+            _command(
+                node,
+                source=TaskCommand.SOURCE_APP,
+                confidence=0.10,
+                command_id='app-low-confidence',
+            )
+        )
+
+        assert result is not None
+        assert result.accepted
+        assert result.reason_code is not CommandReason.CONFIDENCE_TOO_LOW
+    finally:
+        node.destroy_node()
+
+
+def test_mock_low_confidence_is_not_rejected_by_voice_threshold():
+    node = _node()
+    try:
+        result = node._on_task_command(
+            _command(
+                node,
+                source=TaskCommand.SOURCE_MOCK,
+                confidence=0.10,
+                command_id='mock-low-confidence',
+            )
+        )
+
+        assert result is not None
+        assert result.accepted
+        assert result.reason_code is not CommandReason.CONFIDENCE_TOO_LOW
+    finally:
+        node.destroy_node()
+
+
+def test_voice_reset_estop_remains_source_forbidden():
+    node = _node()
+    try:
+        result = node._on_task_command(
+            _command(
+                node,
+                task_id=7,
+                source=TaskCommand.SOURCE_VOICE,
+                confidence=1.0,
+                command_id='voice-reset-estop',
+            )
+        )
+
+        assert result is not None
+        assert not result.accepted
+        assert result.reason_code is CommandReason.SOURCE_NOT_ALLOWED
     finally:
         node.destroy_node()
 
