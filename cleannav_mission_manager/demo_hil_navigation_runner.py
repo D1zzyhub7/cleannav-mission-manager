@@ -34,7 +34,7 @@ MAX_EVENT_HISTORY = 256
 # Gazebo world: robot starts near (0, -5), first truth leaf is at (12, -5).
 # RTAB-Map map frame starts near the robot, so the corresponding goal is (12, 0).
 DEMO_TASK_GOALS = {
-    30: (12.0, 0.0, 0.0),
+    30: (-4.0, 0.0, 0.0),
 }
 
 TERMINAL_EVENTS = {
