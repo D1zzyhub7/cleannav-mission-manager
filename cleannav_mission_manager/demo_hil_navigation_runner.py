@@ -31,10 +31,10 @@ MAX_BODY_BYTES = 8192
 MAX_EVENT_HISTORY = 256
 
 # Phase-1 Demo resolver.
-# Frozen mcity initial robot pose is near (0, -5).
-# The first/nearest truth leaf is at (12, -5).
+# Gazebo world: robot starts near (0, -5), first truth leaf is at (12, -5).
+# RTAB-Map map frame starts near the robot, so the corresponding goal is (12, 0).
 DEMO_TASK_GOALS = {
-    30: (12.0, -5.0, 0.0),
+    30: (12.0, 0.0, 0.0),
 }
 
 TERMINAL_EVENTS = {
