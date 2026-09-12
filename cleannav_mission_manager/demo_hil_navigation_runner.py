@@ -21,21 +21,28 @@ from cleannav_mission_manager.adapters.navigation import (
     NavigationEventSink,
     NavigationEventType,
 )
+from cleannav_mission_manager.demo_goals import (
+    DEMO_TASK_GOALS,
+    make_demo_goal,
+)
 from cleannav_mission_manager.domain.generation_gate import GenerationHandle
 from cleannav_mission_manager.node import MissionManagerNode
+
+
+__all__ = [
+    'DEMO_TASK_GOALS',
+    'HilNavigationAdapter',
+    'HilNavigationHttpServer',
+    'make_demo_goal',
+    'create_hil_runtime',
+    'main',
+]
 
 
 HOST = "0.0.0.0"
 PORT = 18081
 MAX_BODY_BYTES = 8192
 MAX_EVENT_HISTORY = 256
-
-# Phase-1 Demo resolver.
-# Gazebo world: robot starts near (0, -5), first truth leaf is at (12, -5).
-# RTAB-Map map frame starts near the robot, so the corresponding goal is (12, 0).
-DEMO_TASK_GOALS = {
-    30: (-4.0, 0.0, 0.0),
-}
 
 TERMINAL_EVENTS = {
     NavigationEventType.GOAL_REJECTED,
@@ -168,7 +175,8 @@ class HilNavigationAdapter:
         event_name: str,
         payload: object | None,
     ) -> bool:
-        """Queue a PC navigation result.
+        """
+        Queue a PC navigation result.
 
         Returns True when the exact event was already accepted.
         """
@@ -547,46 +555,6 @@ class HilNavigationHttpHandler(BaseHTTPRequestHandler):
             + (fmt % args),
             flush=True,
         )
-
-
-def make_demo_goal(
-    command: object,
-    task: object,
-) -> object:
-    """Resolve Phase-1 task30 to the first frozen leaf truth pose."""
-    task_id = int(
-        getattr(task, "task_id")
-    )
-
-    target = DEMO_TASK_GOALS.get(
-        task_id
-    )
-
-    if target is None:
-        return (
-            "hil-demo-goal",
-            str(
-                getattr(
-                    command,
-                    "command_id",
-                )
-            ),
-            task_id,
-        )
-
-    x, y, z = target
-
-    pose = PoseStamped()
-
-    pose.header.frame_id = "map"
-
-    pose.pose.position.x = x
-    pose.pose.position.y = y
-    pose.pose.position.z = z
-
-    pose.pose.orientation.w = 1.0
-
-    return pose
 
 
 def create_hil_runtime(

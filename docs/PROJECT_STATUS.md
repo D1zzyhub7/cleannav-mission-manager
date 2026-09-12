@@ -298,3 +298,25 @@ M1-3 开始采用 framework-first 原则：Mock Navigation Adapter 当前只冻�
 
 本阶段没有验证真实 perception publisher、Nav2、Safety Supervisor、Gazebo 或完整视觉联调；CleaningTargetArray 的生产 topic 仍由调用方显式提供。
 <!-- SW_PER_2_VISUAL_TARGET_ROS_WIRING_STATUS_END -->
+
+<!-- PC_OFFLINE_REAL_RUNTIME_STATUS_START -->
+## PC Offline Real Runtime Composition
+
+已完成并通过源码级/单元验证：
+
+- 新增 `python3 -m cleannav_mission_manager.demo_pc_offline_runner` 独立入口。
+- PC offline composition 通过既有 `MissionManagerNode.create_real_runtime()` 组装
+  `RealNavigationAdapter` 与 `RealSafetyAdapter`。
+- task30 继续使用 smoke-test 目标 `(-4.0, 0.0, 0.0)`，生成 `map` frame、
+  `orientation.w=1.0` 的 `PoseStamped`。
+- 共享 demo goal resolver 保持 HIL 的 task30 语义；PC offline 对未支持 task
+  明确抛出 deterministic `GoalResolutionError`，不提交非法导航 payload。
+- 默认 `MissionManagerNode()` 仍为 mock runtime；HIL runner 仍为
+  `HilNavigationAdapter + MockSafetyAdapter`。
+- PC offline runner 不包含人工 autonomous heartbeat；lease acquire/release
+  继续由既有 Core transition effects 驱动。
+
+定向组合与相关回归：`162 passed`；完整 `test/unit`：`512 passed`。
+未启动 Nav2、Safety Supervisor、Gazebo 或真实运动；真实 PC offline 闭环仍待用户
+在 ROS 运行环境中执行。
+<!-- PC_OFFLINE_REAL_RUNTIME_STATUS_END -->
