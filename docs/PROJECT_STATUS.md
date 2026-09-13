@@ -320,3 +320,22 @@ M1-3 开始采用 framework-first 原则：Mock Navigation Adapter 当前只冻�
 未启动 Nav2、Safety Supervisor、Gazebo 或真实运动；真实 PC offline 闭环仍待用户
 在 ROS 运行环境中执行。
 <!-- PC_OFFLINE_REAL_RUNTIME_STATUS_END -->
+
+<!-- INT_1_PC_DEMO_STATUS_START -->
+## INT-1 PC Demo TaskCommand Entry
+
+已完成离线集成入口：
+
+- `cleannav_pc_demo` 复用 `demo_pc_offline_runner`，通过正式
+  `/cleannav/hmi/task_command` 接收 `cleannav_interfaces/msg/TaskCommand`。
+- 新增 `launch/pc_demo.launch.py`，只注入真实 Navigation/Safety adapter；不改变
+  Navigation frozen core 或 Safety `/cmd_vel` gate。
+- ROS glue 对 TaskCommand、execution、Safety lease、Navigation result 和 execution
+  finish 输出可审计 lifecycle token。
+- task30 的 PC 目标仍是明确标记的 demo-only `map` pose `(-4.0, 0.0)`；正式
+  Task Catalog 语义仍为 `LEAF + NEAREST_VALID`，未修改接口或 catalog。
+
+离线验证：Mission Manager `514 passed`；colcon test `517 tests, 0 errors,
+0 failures, 1 skipped`。Navigation chain colcon test `125 tests, 0 errors,
+0 failures, 0 skipped`。真实 Nav2/Safety/Gazebo/车辆 Runtime 仍待人工执行。
+<!-- INT_1_PC_DEMO_STATUS_END -->

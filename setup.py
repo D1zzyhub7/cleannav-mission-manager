@@ -28,6 +28,8 @@ setup(
     entry_points={
         'console_scripts': [
             'mission_manager_node = cleannav_mission_manager.node:main',
+            'cleannav_pc_demo = '
+            'cleannav_mission_manager.demo_pc_offline_runner:main',
         ],
     },
 )

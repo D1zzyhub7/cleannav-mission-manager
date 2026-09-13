@@ -26,6 +26,7 @@ from cleannav_mission_manager.adapters.mock_safety import (
 from cleannav_mission_manager.adapters.navigation import (
     NavigationAdapter,
     NavigationEvent,
+    NavigationEventType,
 )
 from cleannav_mission_manager.adapters.real_navigation import (
     RealNavigationAdapter,
@@ -36,6 +37,7 @@ from cleannav_mission_manager.adapters.real_safety import (
 from cleannav_mission_manager.adapters.safety import (
     SafetyAdapter,
     SafetyEvent,
+    SafetyEventType,
 )
 from cleannav_mission_manager.core import (
     CoreResult,
@@ -347,6 +349,11 @@ class MissionManagerNode(Node):
         message: TaskCommand,
     ) -> CoreResult | None:
         """Convert and submit one TaskCommand without duplicating policy."""
+        self.get_logger().info(
+            'TASK_RECEIVED '
+            f'task_id={int(message.task_id)} '
+            f'command_id={message.command_id}'
+        )
         try:
             command = ros_task_command_to_normalized(message)
         except RosConversionError as exc:
@@ -367,11 +374,36 @@ class MissionManagerNode(Node):
                 command_id=command.command_id,
                 execution_id=getattr(result, 'execution_id', None),
             )
+        execution_id = getattr(result, 'execution_id', None)
+        if getattr(result, 'accepted', False) and execution_id:
+            self.get_logger().info(
+                'EXECUTION_CREATED '
+                f'execution_id={execution_id} '
+                f'command_id={command.command_id}'
+            )
         return result
 
     def _on_navigation_event(self, event: NavigationEvent) -> CoreResult:
         """Forward a navigation event, then publish current stored status."""
         result = self._core.handle_navigation_event(event)
+        if event.event_type is NavigationEventType.GOAL_ACCEPTED:
+            self.get_logger().info(
+                'NAVIGATION_STARTED '
+                f'execution_id={event.handle.execution_id}'
+            )
+        elif event.event_type is NavigationEventType.SUCCEEDED:
+            self.get_logger().info(
+                'NAVIGATION_SUCCEEDED '
+                f'execution_id={event.handle.execution_id}'
+            )
+        elif event.event_type in (
+            NavigationEventType.GOAL_REJECTED,
+            NavigationEventType.FAILED,
+        ):
+            self.get_logger().warning(
+                'NAVIGATION_FAILED '
+                f'execution_id={event.handle.execution_id}'
+            )
         execution_id = event.handle.execution_id
         command_id = self._command_id_for_execution(execution_id)
         self._publish_latest_status(
@@ -383,12 +415,30 @@ class MissionManagerNode(Node):
     def _on_safety_event(self, event: SafetyEvent) -> CoreResult:
         """Forward a safety event, then publish current stored status."""
         result = self._core.handle_safety_event(event)
+        if event.event_type is SafetyEventType.LEASE_ACQUIRED:
+            self.get_logger().info(
+                'SAFETY_LEASE_ACQUIRED '
+                f'execution_id={event.execution_id}'
+            )
+        elif event.event_type is SafetyEventType.LEASE_RELEASED:
+            self.get_logger().info(
+                'SAFETY_LEASE_RELEASED '
+                f'execution_id={event.execution_id}'
+            )
         execution_id = event.execution_id
         command_id = self._command_id_for_execution(execution_id)
         self._publish_latest_status(
             command_id=command_id or self._last_command_id,
             execution_id=execution_id,
         )
+        if (
+            event.event_type is SafetyEventType.LEASE_RELEASED
+            and self._core.active_execution is None
+        ):
+            self.get_logger().info(
+                'EXECUTION_FINISHED '
+                f'execution_id={execution_id}'
+            )
         return result
 
     def _command_id_for_execution(

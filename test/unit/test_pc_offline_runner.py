@@ -1,6 +1,7 @@
 """Tests for the independent PC offline runtime composition."""
 
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 import rclpy
@@ -104,3 +105,34 @@ def test_hil_runtime_keeps_hil_navigation_and_mock_safety():
         assert not isinstance(runtime.safety, RealSafetyAdapter)
     finally:
         node.destroy_node()
+
+
+def test_pc_demo_entrypoint_and_launch_reuse_task_command_runtime():
+    package_root = Path(__file__).resolve().parents[2]
+    setup_source = (package_root / 'setup.py').read_text(encoding='utf-8')
+    launch_source = (
+        package_root / 'launch' / 'pc_demo.launch.py'
+    ).read_text(encoding='utf-8')
+
+    assert 'cleannav_pc_demo =' in setup_source
+    assert 'demo_pc_offline_runner:main' in setup_source
+    assert "executable='cleannav_pc_demo'" in launch_source
+    assert "use_sim_time" in launch_source
+
+
+def test_pc_demo_lifecycle_tokens_are_emitted_by_ros_glue_source():
+    package_root = Path(__file__).resolve().parents[2]
+    source = (
+        package_root / 'cleannav_mission_manager' / 'node.py'
+    ).read_text(encoding='utf-8')
+    for token in (
+        'TASK_RECEIVED',
+        'EXECUTION_CREATED',
+        'SAFETY_LEASE_ACQUIRED',
+        'NAVIGATION_STARTED',
+        'NAVIGATION_SUCCEEDED',
+        'NAVIGATION_FAILED',
+        'SAFETY_LEASE_RELEASED',
+        'EXECUTION_FINISHED',
+    ):
+        assert token in source

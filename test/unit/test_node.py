@@ -223,6 +223,9 @@ def test_topics_and_qos_match_frozen_contract():
         assert node.task_status_topic == '/cleannav/task_status'
 
         command_qos = node._task_command_subscription.qos_profile
+        callback = node._task_command_subscription.callback
+        assert callback.__self__ is node
+        assert callback.__func__ is MissionManagerNode._on_task_command
         assert command_qos.reliability == ReliabilityPolicy.RELIABLE
         assert command_qos.durability == DurabilityPolicy.VOLATILE
         assert command_qos.history == HistoryPolicy.KEEP_LAST
