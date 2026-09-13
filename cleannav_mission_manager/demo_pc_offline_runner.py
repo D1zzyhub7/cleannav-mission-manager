@@ -13,6 +13,7 @@ from cleannav_mission_manager.adapters.real_safety import RealSafetyAdapter
 from cleannav_mission_manager.core import GoalResolutionError
 from cleannav_mission_manager.demo_goals import (
     DEMO_TASK_GOALS,
+    demo_goal_from_node,
     make_demo_goal,
 )
 from cleannav_mission_manager.node import (
@@ -24,6 +25,8 @@ from cleannav_mission_manager.node import (
 def make_pc_offline_demo_goal(
     command: object,
     task: object,
+    *,
+    demo_goal: object | None = None,
 ) -> object:
     """
     Resolve only the supported PC offline smoke-test task.
@@ -39,14 +42,28 @@ def make_pc_offline_demo_goal(
             'PC offline demo goal is unsupported for '
             f'task_id={task_id}'
         )
-    return make_demo_goal(command, task)
+    return make_demo_goal(command, task, demo_goal=demo_goal)
 
 
 def create_pc_offline_runtime(
     node: MissionManagerNode,
 ) -> RuntimeComposition:
     """Inject real Navigation and Safety adapters for PC-only execution."""
-    return node.create_real_runtime(make_pc_offline_demo_goal)
+    demo_goal = demo_goal_from_node(node)
+    node.get_logger().info(
+        "DEMO_ONLY_GOAL enabled: "
+        f"x={demo_goal[0]:.3f} y={demo_goal[1]:.3f} "
+        f"yaw={demo_goal[2]:.3f} rad; task30 resolver only"
+    )
+
+    def resolve_demo_goal(command: object, task: object) -> object:
+        return make_pc_offline_demo_goal(
+            command,
+            task,
+            demo_goal=demo_goal,
+        )
+
+    return node.create_real_runtime(resolve_demo_goal)
 
 
 def main(args=None) -> None:

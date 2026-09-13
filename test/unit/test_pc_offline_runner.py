@@ -1,5 +1,6 @@
 """Tests for the independent PC offline runtime composition."""
 
+import math
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -60,7 +61,7 @@ def test_pc_offline_runtime_wires_real_navigation_and_safety():
         assert isinstance(runtime.navigation, RealNavigationAdapter)
         assert isinstance(runtime.safety, RealSafetyAdapter)
         assert not isinstance(runtime.safety, MockSafetyAdapter)
-        assert runtime.core._goal_resolver is make_pc_offline_demo_goal
+        assert callable(runtime.core._goal_resolver)
     finally:
         node.destroy_node()
 
@@ -74,6 +75,39 @@ def test_pc_offline_goal_resolver_returns_frozen_map_pose():
     assert goal.pose.position.y == pytest.approx(0.0)
     assert goal.pose.position.z == pytest.approx(0.0)
     assert goal.pose.orientation.w == pytest.approx(1.0)
+
+
+def test_pc_offline_goal_resolver_accepts_demo_only_override():
+    goal = make_pc_offline_demo_goal(
+        _command(),
+        _task(30),
+        demo_goal=(5.0, -5.0, 1.25),
+    )
+
+    assert goal.pose.position.x == pytest.approx(5.0)
+    assert goal.pose.position.y == pytest.approx(-5.0)
+    assert goal.pose.orientation.z == pytest.approx(math.sin(1.25 / 2.0))
+    assert goal.pose.orientation.w == pytest.approx(
+        math.cos(1.25 / 2.0)
+    )
+
+
+def test_pc_offline_runtime_reads_demo_goal_parameters():
+    node = MissionManagerNode(
+        parameter_overrides=[
+            Parameter('runtime_mode', value='mock'),
+            Parameter('demo_goal_x', value=5.0),
+            Parameter('demo_goal_y', value=-5.0),
+            Parameter('demo_goal_yaw', value=1.25),
+        ],
+        runtime_factory=create_pc_offline_runtime,
+    )
+    try:
+        goal = node.runtime.core._goal_resolver(_command(), _task(30))
+        assert goal.pose.position.x == pytest.approx(5.0)
+        assert goal.pose.position.y == pytest.approx(-5.0)
+    finally:
+        node.destroy_node()
 
 
 def test_pc_offline_goal_resolver_rejects_unsupported_task_deterministically():

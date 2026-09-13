@@ -119,6 +119,9 @@ class MissionManagerNode(Node):
         super().__init__('mission_manager_node', **kwargs)
 
         self.declare_parameter('runtime_mode', 'mock')
+        self.declare_parameter('demo_goal_x', -4.0)
+        self.declare_parameter('demo_goal_y', 0.0)
+        self.declare_parameter('demo_goal_yaw', 0.0)
         runtime_mode = self.get_parameter('runtime_mode').value
         if runtime_mode != 'mock':
             raise RuntimeError(
