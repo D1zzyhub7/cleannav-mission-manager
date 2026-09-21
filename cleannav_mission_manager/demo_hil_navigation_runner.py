@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
-"""Demo-only HTTP HIL navigation runtime for CleanNav Mission Manager."""
+"""
+Competition-only HTTP HIL ingress for CleanNav Mission Manager.
+
+This module is not a production vehicle runtime. It accepts J6-side HTTP
+TaskCommand input and exposes navigation events/results for the PC simulation
+execution adapter. J6 Mission Manager remains the mission authority.
+"""
 
 from __future__ import annotations
 
+import argparse
 import json
+import math
+import os
 import queue
+import re
+import sys
 import threading
 from collections import deque
 from dataclasses import dataclass, field
@@ -13,7 +24,14 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import rclpy
+from cleannav_interfaces.msg import TaskCommand
 from geometry_msgs.msg import PoseStamped
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
 
 from cleannav_mission_manager.adapters.mock_safety import MockSafetyAdapter
 from cleannav_mission_manager.adapters.navigation import (
@@ -31,18 +49,33 @@ from cleannav_mission_manager.node import MissionManagerNode
 
 __all__ = [
     'DEMO_TASK_GOALS',
+    'HIL_BIND_HOST_ENV',
+    'HIL_BIND_PORT_ENV',
     'HilNavigationAdapter',
     'HilNavigationHttpServer',
+    'HilTaskIngress',
     'make_demo_goal',
     'create_hil_runtime',
+    'resolve_hil_bind_address',
     'main',
 ]
 
 
 HOST = "0.0.0.0"
 PORT = 18081
+HIL_BIND_HOST_ENV = "CLEANNAV_J6_HIL_BIND_HOST"
+HIL_BIND_PORT_ENV = "CLEANNAV_J6_HIL_PORT"
 MAX_BODY_BYTES = 8192
 MAX_EVENT_HISTORY = 256
+TASK_COMMAND_TOPIC = "/cleannav/hmi/task_command"
+TASK_COMMAND_INTERFACE_VERSION = "1.0"
+DEFAULT_TASK_VALID_FOR_SEC = 60.0
+TASK_COMMAND_ID_MAX_LENGTH = 128
+TASK_RAW_TEXT_MAX_LENGTH = 512
+_COMMAND_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]+")
+_ROS_DURATION_MAX_NS = (
+    ((2**31 - 1) * 1_000_000_000) + 999_999_999
+)
 
 TERMINAL_EVENTS = {
     NavigationEventType.GOAL_REJECTED,
@@ -53,6 +86,34 @@ TERMINAL_EVENTS = {
 }
 
 
+def resolve_hil_bind_address(
+    cli_host: str | None = None,
+    cli_port: int | None = None,
+    *,
+    environ: dict[str, str] | None = None,
+) -> tuple[str, int]:
+    """Resolve the HIL server bind address without changing its defaults."""
+    environment = os.environ if environ is None else environ
+    host = cli_host or environment.get(HIL_BIND_HOST_ENV) or HOST
+    raw_port = cli_port
+    if raw_port is None:
+        raw_port = environment.get(HIL_BIND_PORT_ENV, str(PORT))
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("HIL bind port must be an integer") from exc
+    if not host or not 1 <= port <= 65535:
+        raise ValueError("HIL bind host/port is invalid")
+    return str(host), port
+
+
+def _parse_cli_args(args: list[str]) -> tuple[argparse.Namespace, list[str]]:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--hil-bind-host")
+    parser.add_argument("--hil-port", type=int)
+    return parser.parse_known_args(args)
+
+
 @dataclass
 class _NavigationRecord:
     handle: GenerationHandle
@@ -60,6 +121,181 @@ class _NavigationRecord:
     cancel_requested: bool = False
     terminal_event: NavigationEventType | None = None
     queued_events: set[NavigationEventType] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class _TaskSpec:
+    task_id: int
+    source: int
+    command_id: str
+    confidence: float
+    raw_text: str
+    user_confirmed: bool
+    valid_for_sec: float
+
+
+class HilTaskIngress:
+    """Queue validated HTTP tasks and publish them from the ROS thread."""
+
+    def __init__(self, node: MissionManagerNode) -> None:
+        self._node = node
+        self._queue: queue.Queue[_TaskSpec] = queue.Queue()
+        self._qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self._publisher = node.create_publisher(
+            TaskCommand,
+            TASK_COMMAND_TOPIC,
+            self._qos,
+        )
+
+    @property
+    def topic(self) -> str:
+        """Return the formal Mission Manager TaskCommand ingress topic."""
+        return TASK_COMMAND_TOPIC
+
+    @property
+    def qos(self) -> QoSProfile:
+        """Return the publisher QoS for compatibility tests."""
+        return self._qos
+
+    def enqueue_task(self, payload: object) -> _TaskSpec:
+        """Validate one HTTP JSON object and enqueue only plain task data."""
+        spec = self._validate_task_spec(payload)
+        self._queue.put(spec)
+        return spec
+
+    def drain_task_queue(self) -> None:
+        """Build and publish TaskCommand messages on the ROS executor thread."""
+        while True:
+            try:
+                spec = self._queue.get_nowait()
+            except queue.Empty:
+                return
+
+            message = TaskCommand()
+            message.header.stamp = self._node.get_clock().now().to_msg()
+            message.header.frame_id = ""
+            message.interface_version = TASK_COMMAND_INTERFACE_VERSION
+            message.command_id = spec.command_id
+            message.source = spec.source
+            message.task_id = spec.task_id
+            message.confidence = spec.confidence
+            message.raw_text = spec.raw_text
+            duration_sec, duration_nanosec = self._duration_parts(
+                spec.valid_for_sec
+            )
+            message.valid_for.sec = duration_sec
+            message.valid_for.nanosec = duration_nanosec
+            message.user_confirmed = spec.user_confirmed
+            self._publisher.publish(message)
+            self._node.get_logger().info(
+                "HIL_TASK_COMMAND_PUBLISHED "
+                f"task_id={spec.task_id} "
+                f"source={spec.source} "
+                f"command_id={spec.command_id}"
+            )
+
+    @staticmethod
+    def _validate_task_spec(payload: object) -> _TaskSpec:
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+
+        task_id = payload.get("task_id")
+        if type(task_id) is not int or not 0 <= task_id <= 65535:
+            raise ValueError("task_id must be an int in [0, 65535]")
+
+        source = payload.get("source")
+        if type(source) is not int or source not in (
+            TaskCommand.SOURCE_VOICE,
+            TaskCommand.SOURCE_APP,
+            TaskCommand.SOURCE_MOCK,
+        ):
+            raise ValueError(
+                "source must be one of 1 (VOICE), 2 (APP), 3 (MOCK)"
+            )
+
+        command_id = payload.get("command_id")
+        if (
+            not isinstance(command_id, str)
+            or not command_id
+            or len(command_id) > TASK_COMMAND_ID_MAX_LENGTH
+            or _COMMAND_ID_PATTERN.fullmatch(command_id) is None
+        ):
+            raise ValueError(
+                "command_id must match ^[A-Za-z0-9._:-]+$ and be at most "
+                f"{TASK_COMMAND_ID_MAX_LENGTH} characters"
+            )
+
+        confidence_value = payload.get("confidence")
+        if isinstance(confidence_value, bool) or not isinstance(
+            confidence_value,
+            (int, float),
+        ):
+            raise ValueError("confidence must be a number in [0.0, 1.0]")
+        confidence = float(confidence_value)
+        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            raise ValueError(
+                "confidence must be a finite number in [0.0, 1.0]"
+            )
+
+        raw_text = payload.get("raw_text", "")
+        if (
+            not isinstance(raw_text, str)
+            or len(raw_text) > TASK_RAW_TEXT_MAX_LENGTH
+        ):
+            raise ValueError(
+                "raw_text must be a string of at most "
+                f"{TASK_RAW_TEXT_MAX_LENGTH} characters"
+            )
+
+        user_confirmed = payload.get("user_confirmed", False)
+        if type(user_confirmed) is not bool:
+            raise ValueError("user_confirmed must be a boolean")
+
+        valid_for_value = payload.get(
+            "valid_for_sec",
+            DEFAULT_TASK_VALID_FOR_SEC,
+        )
+        if isinstance(valid_for_value, bool) or not isinstance(
+            valid_for_value,
+            (int, float),
+        ):
+            raise ValueError("valid_for_sec must be a finite number > 0")
+        valid_for_sec = float(valid_for_value)
+        if not math.isfinite(valid_for_sec) or valid_for_sec <= 0.0:
+            raise ValueError("valid_for_sec must be a finite number > 0")
+        HilTaskIngress._duration_parts(valid_for_sec)
+
+        return _TaskSpec(
+            task_id=task_id,
+            source=source,
+            command_id=command_id,
+            confidence=confidence,
+            raw_text=raw_text,
+            user_confirmed=user_confirmed,
+            valid_for_sec=valid_for_sec,
+        )
+
+    @staticmethod
+    def _duration_parts(valid_for_sec: float) -> tuple[int, int]:
+        if (
+            not math.isfinite(valid_for_sec)
+            or valid_for_sec <= 0.0
+            or valid_for_sec > _ROS_DURATION_MAX_NS / 1_000_000_000
+        ):
+            raise ValueError(
+                "valid_for_sec cannot be represented as a positive ROS Duration"
+            )
+        total_nanoseconds = int(round(valid_for_sec * 1_000_000_000))
+        if not 0 < total_nanoseconds <= _ROS_DURATION_MAX_NS:
+            raise ValueError(
+                "valid_for_sec cannot be represented as a positive ROS Duration"
+            )
+        return divmod(total_nanoseconds, 1_000_000_000)
 
 
 class HilNavigationAdapter:
@@ -363,8 +599,10 @@ class HilNavigationHttpServer(ThreadingHTTPServer):
         self,
         server_address: tuple[str, int],
         adapter: HilNavigationAdapter,
+        task_ingress: HilTaskIngress | None = None,
     ) -> None:
         self.adapter = adapter
+        self.task_ingress = task_ingress
 
         super().__init__(
             server_address,
@@ -379,6 +617,10 @@ class HilNavigationHttpHandler(BaseHTTPRequestHandler):
     @property
     def adapter(self) -> HilNavigationAdapter:
         return self.server.adapter
+
+    @property
+    def task_ingress(self) -> HilTaskIngress | None:
+        return self.server.task_ingress
 
     def _json_response(
         self,
@@ -415,9 +657,11 @@ class HilNavigationHttpHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if parsed.path == "/health":
+            health = self.adapter.health_snapshot()
+            health["task_ingress"] = self.task_ingress is not None
             self._json_response(
                 200,
-                self.adapter.health_snapshot(),
+                health,
             )
             return
 
@@ -461,7 +705,7 @@ class HilNavigationHttpHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
 
-        if parsed.path != "/nav/result":
+        if parsed.path not in ("/nav/result", "/task"):
             self._json_response(
                 404,
                 {
@@ -501,6 +745,32 @@ class HilNavigationHttpHandler(BaseHTTPRequestHandler):
                 raise ValueError(
                     "JSON body must be an object"
                 )
+
+            if parsed.path == "/task":
+                if self.task_ingress is None:
+                    self._json_response(
+                        503,
+                        {"error": "task_ingress_unavailable"},
+                    )
+                    return
+                spec = self.task_ingress.enqueue_task(body)
+                self.log_message(
+                    "HIL_HTTP_TASK_ACCEPTED task_id=%d "
+                    "source=%d command_id=%s",
+                    spec.task_id,
+                    spec.source,
+                    spec.command_id,
+                )
+                self._json_response(
+                    202,
+                    {
+                        "accepted_for_delivery": True,
+                        "task_id": spec.task_id,
+                        "source": spec.source,
+                        "command_id": spec.command_id,
+                    },
+                )
+                return
 
             nav_request_id = body.get(
                 "nav_request_id"
@@ -564,6 +834,7 @@ def create_hil_runtime(
     navigation = HilNavigationAdapter(
         node._on_navigation_event
     )
+    task_ingress = HilTaskIngress(node)
 
     safety = MockSafetyAdapter(
         node._on_safety_event
@@ -581,13 +852,23 @@ def create_hil_runtime(
         0.02,
         navigation.drain_result_queue,
     )
+    node.create_timer(
+        0.02,
+        task_ingress.drain_task_queue,
+    )
+    node._hil_task_ingress = task_ingress
 
     return runtime
 
 
 def main(args=None) -> None:
-
-    rclpy.init(args=args)
+    cli_args = list(sys.argv[1:] if args is None else args)
+    parsed_args, ros_args = _parse_cli_args(cli_args)
+    hil_host, hil_port = resolve_hil_bind_address(
+        parsed_args.hil_bind_host,
+        parsed_args.hil_port,
+    )
+    rclpy.init(args=ros_args)
 
     node = None
     server = None
@@ -610,9 +891,16 @@ def main(args=None) -> None:
                 "HIL navigation runtime was not assembled"
             )
 
+        task_ingress = getattr(node, "_hil_task_ingress", None)
+        if not isinstance(task_ingress, HilTaskIngress):
+            raise RuntimeError(
+                "HIL task ingress was not assembled"
+            )
+
         server = HilNavigationHttpServer(
-            (HOST, PORT),
+            (hil_host, hil_port),
             runtime.navigation,
+            task_ingress,
         )
 
         http_thread = threading.Thread(
@@ -625,7 +913,8 @@ def main(args=None) -> None:
 
         node.get_logger().info(
             "Demo HIL navigation runtime active; "
-            f"HTTP listening on {HOST}:{PORT}"
+            f"HTTP listening on {hil_host}:{hil_port} "
+            "mode=COMPETITION_HIL_ONLY"
         )
 
         node.get_logger().info(
