@@ -40,6 +40,8 @@ class RealSafetyAdapter:
             raise TypeError('event_sink must be callable')
 
         self._event_sink = event_sink
+        get_logger = getattr(node, 'get_logger', None)
+        self._logger = get_logger() if callable(get_logger) else None
         self._acquire_client = (
             acquire_client
             if acquire_client is not None
@@ -75,6 +77,10 @@ class RealSafetyAdapter:
         self._validate_execution_id(execution_id)
         request = SafetyLease.Request()
         request.execution_id = execution_id
+        self._log_info(
+            'SAFETY_LEASE_REQUEST '
+            f'execution_id={execution_id}'
+        )
         self._call_lease_service(
             self._acquire_client,
             request,
@@ -129,12 +135,22 @@ class RealSafetyAdapter:
         failure_event: SafetyEventType,
     ) -> None:
         if not client.service_is_ready():
+            self._log_warning(
+                'SAFETY_LEASE_NOT_SENT '
+                'reason=SERVICE_NOT_READY '
+                f'execution_id={execution_id}'
+            )
             self._emit(failure_event, execution_id)
             return
 
         try:
             future = client.call_async(request)
         except Exception:
+            self._log_warning(
+                'SAFETY_LEASE_NOT_SENT '
+                'reason=CALL_EXCEPTION '
+                f'execution_id={execution_id}'
+            )
             self._emit(failure_event, execution_id)
             return
         self._register_response_callback(
@@ -164,7 +180,21 @@ class RealSafetyAdapter:
                 )
             )
         except Exception:
+            self._log_warning(
+                'SAFETY_LEASE_CALLBACK_NOT_REGISTERED '
+                f'execution_id={execution_id}'
+            )
             self._emit(failure_event, execution_id)
+
+    def _log_info(self, message: str) -> None:
+        """Emit diagnostics when the adapter is attached to a ROS node."""
+        if self._logger is not None:
+            self._logger.info(message)
+
+    def _log_warning(self, message: str) -> None:
+        """Emit diagnostics without requiring test doubles to provide logging."""
+        if self._logger is not None:
+            self._logger.warning(message)
 
     def _on_response(
         self,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -66,6 +67,8 @@ class RealNavigationAdapter:
             raise ValueError('action_name must not be empty')
 
         self._event_sink = event_sink
+        get_logger = getattr(node, 'get_logger', None)
+        self._logger = get_logger() if callable(get_logger) else None
         self._action_client = (
             action_client
             if action_client is not None
@@ -94,12 +97,30 @@ class RealNavigationAdapter:
 
         try:
             if not self._action_client.server_is_ready():
+                self._log_warning(
+                    'NAVIGATION_GOAL_NOT_SENT '
+                    'reason=ACTION_SERVER_NOT_READY '
+                    f'execution_id={handle.execution_id}'
+                )
                 self._emit_terminal(record, NavigationEventType.GOAL_REJECTED)
                 return
             send_future = self._action_client.send_goal_async(goal)
         except Exception:
+            self._log_warning(
+                'NAVIGATION_GOAL_NOT_SENT '
+                'reason=SEND_EXCEPTION '
+                f'execution_id={handle.execution_id}'
+            )
             self._emit_terminal(record, NavigationEventType.GOAL_REJECTED)
             return
+
+        self._log_info(
+            'NAVIGATION_GOAL_SENT '
+            f'x={goal.pose.pose.position.x:.3f} '
+            f'y={goal.pose.pose.position.y:.3f} '
+            f'yaw={self._yaw_from_quaternion(goal.pose.pose.orientation):.3f} '
+            f'execution_id={handle.execution_id}'
+        )
 
         with self._lock:
             record.send_future = send_future
@@ -113,7 +134,34 @@ class RealNavigationAdapter:
                 lambda future: self._on_goal_response(record, future)
             )
         except Exception:
+            self._log_warning(
+                'NAVIGATION_CALLBACK_NOT_REGISTERED '
+                'reason=REGISTRATION_EXCEPTION '
+                f'execution_id={record.handle.execution_id}'
+            )
             self._emit_terminal(record, NavigationEventType.GOAL_REJECTED)
+
+    def _log_info(self, message: str) -> None:
+        """Emit diagnostics when the adapter is attached to a ROS node."""
+        if self._logger is not None:
+            self._logger.info(message)
+
+    def _log_warning(self, message: str) -> None:
+        """Emit diagnostics without requiring test doubles to provide logging."""
+        if self._logger is not None:
+            self._logger.warning(message)
+
+    @staticmethod
+    def _yaw_from_quaternion(quaternion: object) -> float:
+        """Return planar yaw from a ROS quaternion."""
+        x = float(getattr(quaternion, 'x'))
+        y = float(getattr(quaternion, 'y'))
+        z = float(getattr(quaternion, 'z'))
+        w = float(getattr(quaternion, 'w'))
+        return math.atan2(
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y * y + z * z),
+        )
 
     def cancel_goal(self, handle: GenerationHandle) -> None:
         """Request cancellation while preserving a pre-acceptance race."""

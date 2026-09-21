@@ -361,12 +361,32 @@ class MissionManagerNode(Node):
             command = ros_task_command_to_normalized(message)
         except RosConversionError as exc:
             self.get_logger().warning(
-                f'Ignoring invalid TaskCommand representation: {exc}'
+                'COMMAND_REJECTED '
+                'reason=ROS_CONVERSION_ERROR '
+                f'task_id={int(message.task_id)} '
+                f'command_id={message.command_id} '
+                f'detail={exc}'
             )
             return None
 
+        self.get_logger().info(
+            'TASK_NORMALIZED '
+            f'task_id={command.task_id} '
+            f'command_id={command.command_id} '
+            f'source={command.source}'
+        )
         self._last_command_id = command.command_id
-        result = self._core.submit_command(command)
+        try:
+            result = self._core.submit_command(command)
+        except Exception as exc:
+            self.get_logger().error(
+                'COMMAND_REJECTED '
+                'reason=CORE_EXCEPTION '
+                f'task_id={command.task_id} '
+                f'command_id={command.command_id} '
+                f'detail={exc}'
+            )
+            raise
         immediate_status = getattr(result, 'status_snapshot', None)
         if immediate_status is not None:
             self._publish_status_message(
@@ -382,6 +402,24 @@ class MissionManagerNode(Node):
             self.get_logger().info(
                 'EXECUTION_CREATED '
                 f'execution_id={execution_id} '
+                f'command_id={command.command_id}'
+            )
+        elif getattr(result, 'accepted', False):
+            reason = getattr(result, 'reason_code', 'UNKNOWN')
+            reason_name = getattr(reason, 'name', str(reason))
+            self.get_logger().info(
+                'COMMAND_ACCEPTED_NO_EXECUTION '
+                f'reason={reason_name} '
+                f'task_id={command.task_id} '
+                f'command_id={command.command_id}'
+            )
+        elif not getattr(result, 'accepted', False):
+            reason = getattr(result, 'reason_code', 'UNKNOWN')
+            reason_name = getattr(reason, 'name', str(reason))
+            self.get_logger().warning(
+                'COMMAND_REJECTED '
+                f'reason={reason_name} '
+                f'task_id={command.task_id} '
                 f'command_id={command.command_id}'
             )
         return result
