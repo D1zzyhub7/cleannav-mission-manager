@@ -8,6 +8,10 @@ import math
 import re
 from typing import Mapping, Optional
 
+from cleannav_mission_manager.domain.target_models import (
+    VisualTargetPolicy,
+)
+
 
 _COMMAND_ID_PATTERN = re.compile(r'[A-Za-z0-9._:-]+')
 
@@ -52,8 +56,11 @@ class CommandReason(IntEnum):
     CONFIDENCE_TOO_LOW = 110
     FIELD_INVALID = 111
     NONFINITE_VALUE = 112
+    CONFIRMATION_REQUIRED = 115
     INTERNAL_SOURCE_FORBIDDEN_ON_HMI_TOPIC = 118
     COMMAND_TOO_LARGE = 124
+
+    WAITING_FOR_TARGET = 8
 
     QUEUE_FULL = 200
     TASK_CATALOG_UNAVAILABLE = 201
@@ -64,6 +71,8 @@ class CommandReason(IntEnum):
     NAV_CONCURRENT_GENERATION_FORBIDDEN = 417
 
     TIMESTAMP_INVALID = 609
+
+    TARGET_WAIT_TIMEOUT = 305
 
     ACTIVE_EXECUTION_CONFLICT = 706
     ACTIVE_GENERATION_CONFLICT = 707
@@ -91,6 +100,7 @@ class NormalizedTaskCommand:
     valid_for_ns: int
     confidence: float = 1.0
     raw_text: str = ''
+    user_confirmed: bool = False
 
 
 @dataclass(frozen=True)
@@ -103,6 +113,7 @@ class TaskCatalogEntry:
     enabled: bool
     allowed_sources: frozenset[int]
     requires_confirmation: bool = False
+    visual_target_policy: Optional[VisualTargetPolicy] = None
 
 
 @dataclass(frozen=True)
@@ -122,6 +133,7 @@ class CommandSemanticFingerprint:
     source: int
     task_id: int
     valid_for_ns: int
+    user_confirmed: bool
 
 
 class DedupDecision(Enum):
@@ -153,6 +165,7 @@ def semantic_fingerprint(
         source=command.source,
         task_id=command.task_id,
         valid_for_ns=command.valid_for_ns,
+        user_confirmed=command.user_confirmed,
     )
 
 
@@ -291,6 +304,9 @@ class CommandValidator:
         if len(command.raw_text) > 512:
             return self._reject(CommandReason.COMMAND_TOO_LARGE)
 
+        if type(command.user_confirmed) is not bool:
+            return self._reject(CommandReason.FIELD_INVALID)
+
         if now_ros_ns > (
             command.stamp_ns + command.valid_for_ns
         ):
@@ -311,6 +327,9 @@ class CommandValidator:
 
         if command.source not in task.allowed_sources:
             return self._reject(CommandReason.SOURCE_NOT_ALLOWED)
+
+        if task.requires_confirmation and not command.user_confirmed:
+            return self._reject(CommandReason.CONFIRMATION_REQUIRED)
 
         threshold = self._min_confidence_by_source.get(
             command.source

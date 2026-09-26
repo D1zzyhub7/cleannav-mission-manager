@@ -35,6 +35,7 @@ from cleannav_mission_manager.domain.command_processing import (
 from cleannav_mission_manager.domain.command_store import (
     CommandRecordStore,
     ExternalTaskState,
+    StatusScope,
     TerminalStatusCache,
 )
 from cleannav_mission_manager.domain.execution_store import (
@@ -126,6 +127,7 @@ def _command(
     command_id='command-1',
     task_id=30,
     source=CommandSource.APP,
+    user_confirmed=False,
 ):
     return NormalizedTaskCommand(
         interface_version='1.0',
@@ -135,6 +137,7 @@ def _command(
         stamp_ns=1_000_000_000,
         valid_for_ns=10_000_000_000,
         confidence=1.0,
+        user_confirmed=user_confirmed,
     )
 
 
@@ -261,6 +264,37 @@ def test_existing_validator_and_catalog_reject_invalid_mission(
     assert core.active_execution is None
     assert core.queued_missions == ()
     assert navigation.submitted_calls == ()
+    assert goals == []
+
+
+def test_validation_rejection_returns_ephemeral_command_status_without_storage():
+    core, navigation, safety, goals = _build()
+
+    result = core.submit_command(
+        _command(
+            command_id='reset-unconfirmed',
+            task_id=7,
+            user_confirmed=False,
+        )
+    )
+
+    assert not result.accepted
+    assert result.reason_code is CommandReason.CONFIRMATION_REQUIRED
+    assert result.status_snapshot is not None
+    assert result.status_snapshot.status_scope is StatusScope.COMMAND
+    assert result.status_snapshot.state is ExternalTaskState.REJECTED
+    assert result.status_snapshot.command_id == 'reset-unconfirmed'
+    assert result.status_snapshot.task_id == 7
+    assert result.status_snapshot.execution_id == ''
+    assert result.status_snapshot.reason_code == 115
+    assert core._command_store.get_record('reset-unconfirmed') is None
+    assert core._command_store.get_current_command_status(
+        'reset-unconfirmed'
+    ) is None
+    assert core.active_execution is None
+    assert core.queued_missions == ()
+    assert navigation.submitted_calls == ()
+    assert safety.calls == ()
     assert goals == []
 
 
@@ -523,7 +557,7 @@ def test_resume_preserves_execution_advances_generation_and_resubmits():
     assert core.active_execution.generation == 2
     assert len(navigation.submitted_calls) == 2
     assert navigation.submitted_calls[-1].handle == new_handle
-    assert goals == [('command-1', 30), ('command-1', 30)]
+    assert goals == [('command-1', 30)]
 
     for stale_type in (
         NavigationEventType.GOAL_ACCEPTED,
@@ -635,7 +669,9 @@ def test_reset_waits_for_success_and_returns_to_normal_without_resuming():
     core.submit_command(_command(command_id='estop-1', task_id=6))
 
     reset = core.submit_command(
-        _command(command_id='reset-1', task_id=7)
+        _command(
+            command_id='reset-1', task_id=7, user_confirmed=True
+        )
     )
     assert reset.accepted
     assert core.manager_mode.value == 'EMERGENCY_LATCHED'
@@ -653,7 +689,9 @@ def test_reset_failure_stays_latched_and_replay_does_not_repeat_reset():
     core, _, safety, _ = _build(reset_success=False)
     core.submit_command(_command(command_id='estop-1', task_id=6))
     reset = core.submit_command(
-        _command(command_id='reset-1', task_id=7)
+        _command(
+            command_id='reset-1', task_id=7, user_confirmed=True
+        )
     )
     assert reset.accepted
     safety.emit_reset_result()
@@ -665,7 +703,9 @@ def test_reset_failure_stays_latched_and_replay_does_not_repeat_reset():
     assert terminal.state is ExternalTaskState.FAILED
     before = len(safety.calls)
     replay = core.submit_command(
-        _command(command_id='reset-1', task_id=7)
+        _command(
+            command_id='reset-1', task_id=7, user_confirmed=True
+        )
     )
     assert replay.accepted
     assert len(safety.calls) == before

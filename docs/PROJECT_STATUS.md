@@ -284,3 +284,58 @@ RETURN_HOME 不复用旧 execution_id。
 
 M1-3 开始采用 framework-first 原则：Mock Navigation Adapter 当前只冻结通用 submit / cancel / callback、generation identity 和确定性测试机制，不冻结具体 Task、工作模式、Perception 接入方式或 Navigation Goal 的业务结构。
 <!-- M1_3_FRAMEWORK_FIRST_STATUS_END -->
+
+<!-- SW_PER_2_VISUAL_TARGET_ROS_WIRING_STATUS_START -->
+## SW-PER-2 Visual Target ROS Wiring
+
+已完成并通过静态/单元验证：
+
+- `MissionManagerNode` 默认仍使用 Mock runtime；真实视觉 runtime 必须显式注入 `cleaning_target_topic`。
+- localization 默认输入为 `/rtabmap/localization_pose`，支持测试覆盖。
+- `VisualTargetRosBridge` 将 `CleaningTargetArray` 复用既有 conversion/registry，将合法 `PoseWithCovarianceStamped` 缓存为最新 `map` pose，并复用 Core 的 WAITING_TARGET retry/timeout API。
+- 已验证非法 pose/target 输入不会覆盖合法状态，也不会清空 Registry；无输入时 timer 仍由 Core 负责 timeout。
+- 验证结果：full unit `494 passed`；copyright/flake8/pep257 `2 passed, 1 skipped`；目标文件 py_compile 通过。
+
+本阶段没有验证真实 perception publisher、Nav2、Safety Supervisor、Gazebo 或完整视觉联调；CleaningTargetArray 的生产 topic 仍由调用方显式提供。
+<!-- SW_PER_2_VISUAL_TARGET_ROS_WIRING_STATUS_END -->
+
+<!-- PC_OFFLINE_REAL_RUNTIME_STATUS_START -->
+## PC Offline Real Runtime Composition
+
+已完成并通过源码级/单元验证：
+
+- 新增 `python3 -m cleannav_mission_manager.demo_pc_offline_runner` 独立入口。
+- PC offline composition 通过既有 `MissionManagerNode.create_real_runtime()` 组装
+  `RealNavigationAdapter` 与 `RealSafetyAdapter`。
+- task30 继续使用 smoke-test 目标 `(-4.0, 0.0, 0.0)`，生成 `map` frame、
+  `orientation.w=1.0` 的 `PoseStamped`。
+- 共享 demo goal resolver 保持 HIL 的 task30 语义；PC offline 对未支持 task
+  明确抛出 deterministic `GoalResolutionError`，不提交非法导航 payload。
+- 默认 `MissionManagerNode()` 仍为 mock runtime；HIL runner 仍为
+  `HilNavigationAdapter + MockSafetyAdapter`。
+- PC offline runner 不包含人工 autonomous heartbeat；lease acquire/release
+  继续由既有 Core transition effects 驱动。
+
+定向组合与相关回归：`162 passed`；完整 `test/unit`：`512 passed`。
+未启动 Nav2、Safety Supervisor、Gazebo 或真实运动；真实 PC offline 闭环仍待用户
+在 ROS 运行环境中执行。
+<!-- PC_OFFLINE_REAL_RUNTIME_STATUS_END -->
+
+<!-- INT_1_PC_DEMO_STATUS_START -->
+## INT-1 PC Demo TaskCommand Entry
+
+已完成离线集成入口：
+
+- `cleannav_pc_demo` 复用 `demo_pc_offline_runner`，通过正式
+  `/cleannav/hmi/task_command` 接收 `cleannav_interfaces/msg/TaskCommand`。
+- 新增 `launch/pc_demo.launch.py`，只注入真实 Navigation/Safety adapter；不改变
+  Navigation frozen core 或 Safety `/cmd_vel` gate。
+- ROS glue 对 TaskCommand、execution、Safety lease、Navigation result 和 execution
+  finish 输出可审计 lifecycle token。
+- task30 的 PC 目标仍是明确标记的 demo-only `map` pose `(-4.0, 0.0)`；正式
+  Task Catalog 语义仍为 `LEAF + NEAREST_VALID`，未修改接口或 catalog。
+
+离线验证：Mission Manager `514 passed`；colcon test `517 tests, 0 errors,
+0 failures, 1 skipped`。Navigation chain colcon test `125 tests, 0 errors,
+0 failures, 0 skipped`。真实 Nav2/Safety/Gazebo/车辆 Runtime 仍待人工执行。
+<!-- INT_1_PC_DEMO_STATUS_END -->

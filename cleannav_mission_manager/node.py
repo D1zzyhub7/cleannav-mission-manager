@@ -23,10 +23,25 @@ from cleannav_mission_manager.adapters.mock_navigation import (
 from cleannav_mission_manager.adapters.mock_safety import (
     MockSafetyAdapter,
 )
-from cleannav_mission_manager.adapters.navigation import NavigationEvent
-from cleannav_mission_manager.adapters.safety import SafetyEvent
+from cleannav_mission_manager.adapters.navigation import (
+    NavigationAdapter,
+    NavigationEvent,
+    NavigationEventType,
+)
+from cleannav_mission_manager.adapters.real_navigation import (
+    RealNavigationAdapter,
+)
+from cleannav_mission_manager.adapters.real_safety import (
+    RealSafetyAdapter,
+)
+from cleannav_mission_manager.adapters.safety import (
+    SafetyAdapter,
+    SafetyEvent,
+    SafetyEventType,
+)
 from cleannav_mission_manager.core import (
     CoreResult,
+    GoalResolver,
     MissionManagerCore,
 )
 from cleannav_mission_manager.domain.command_processing import (
@@ -41,11 +56,24 @@ from cleannav_mission_manager.domain.execution_store import (
 )
 from cleannav_mission_manager.domain.generation_gate import GenerationGate
 from cleannav_mission_manager.domain.mission_queue import MissionQueue
+from cleannav_mission_manager.domain.runtime_policy import (
+    MIN_CONFIDENCE_BY_SOURCE,
+)
 from cleannav_mission_manager.domain.task_catalog import load_task_catalog
 from cleannav_mission_manager.ros_conversion import (
     RosConversionError,
     ros_task_command_to_normalized,
     status_snapshot_to_ros,
+)
+from cleannav_mission_manager.domain.target_registry import TargetRegistry
+from cleannav_mission_manager.domain.target_selector import TargetSelector
+from cleannav_mission_manager.visual_target_goal_resolver import (
+    VisualTargetGoalResolver,
+)
+from cleannav_mission_manager.visual_target_ros_bridge import (
+    LOCALIZATION_TOPIC,
+    LatestRobotPoseProvider,
+    VisualTargetRosBridge,
 )
 
 
@@ -66,13 +94,13 @@ class _RosClockAdapter:
 
 @dataclass(frozen=True)
 class RuntimeComposition:
-    """Concrete dependencies assembled for the explicit mock runtime."""
+    """Concrete dependencies assembled for one Mission Manager runtime."""
 
     core: MissionManagerCore
     command_store: CommandRecordStore
     execution_store: ExecutionRecordStore
-    navigation: MockNavigationAdapter
-    safety: MockSafetyAdapter
+    navigation: NavigationAdapter
+    safety: SafetyAdapter
 
 
 RuntimeFactory = Callable[['MissionManagerNode'], RuntimeComposition]
@@ -91,6 +119,9 @@ class MissionManagerNode(Node):
         super().__init__('mission_manager_node', **kwargs)
 
         self.declare_parameter('runtime_mode', 'mock')
+        self.declare_parameter('demo_goal_x', -4.0)
+        self.declare_parameter('demo_goal_y', 0.0)
+        self.declare_parameter('demo_goal_yaw', 0.0)
         runtime_mode = self.get_parameter('runtime_mode').value
         if runtime_mode != 'mock':
             raise RuntimeError(
@@ -102,6 +133,11 @@ class MissionManagerNode(Node):
         self._command_store: CommandRecordStore | None = None
         self._execution_store: ExecutionRecordStore | None = None
         self._last_command_id: str | None = None
+        self._visual_target_bridge: VisualTargetRosBridge | None = None
+        self._visual_target_registry: TargetRegistry | None = None
+        self._visual_target_pose_provider: (
+            LatestRobotPoseProvider | None
+        ) = None
 
         self._task_command_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -170,31 +206,17 @@ class MissionManagerNode(Node):
 
     @property
     def runtime(self) -> RuntimeComposition | None:
-        """Return the mock composition for integration tests, if present."""
+        """Return the assembled runtime for integration tests, if present."""
         return self._runtime
 
     def _create_mock_runtime(self) -> RuntimeComposition:
-        """Build the only currently supported, explicitly named runtime."""
-        catalog_share = Path(
-            get_package_share_directory('cleannav_interfaces')
-        )
-        catalog = load_task_catalog(
-            catalog_share / 'config' / 'task_catalog.yaml'
-        )
-
+        """Build the default deterministic runtime with mock adapters."""
         navigation = MockNavigationAdapter(
-            lambda event: self._on_navigation_event(event)
+            self._on_navigation_event
         )
         safety = MockSafetyAdapter(
-            lambda event: self._on_safety_event(event)
+            self._on_safety_event
         )
-
-        execution_counter = 0
-
-        def make_execution_id() -> str:
-            nonlocal execution_counter
-            execution_counter += 1
-            return f'ros-execution-{execution_counter}'
 
         def resolve_goal(
             command: NormalizedTaskCommand,
@@ -203,13 +225,111 @@ class MissionManagerNode(Node):
             """Return a deterministic opaque payload for mock navigation."""
             return ('mock-goal', command.command_id, task.task_id)
 
+        return self._create_runtime(
+            navigation=navigation,
+            safety=safety,
+            goal_resolver=resolve_goal,
+        )
+
+    def create_real_runtime(
+        self,
+        goal_resolver: GoalResolver,
+    ) -> RuntimeComposition:
+        """Build a real-adapter runtime with an injected goal resolver."""
+        navigation = RealNavigationAdapter(
+            self,
+            self._on_navigation_event,
+        )
+        safety = RealSafetyAdapter(
+            self,
+            self._on_safety_event,
+        )
+        return self._create_runtime(
+            navigation=navigation,
+            safety=safety,
+            goal_resolver=goal_resolver,
+        )
+
+    def create_visual_real_runtime(
+        self,
+        *,
+        cleaning_target_topic: str,
+        localization_topic: str = LOCALIZATION_TOPIC,
+    ) -> RuntimeComposition:
+        """Build the real runtime and explicit visual ROS input bridge."""
+        if not isinstance(cleaning_target_topic, str):
+            raise TypeError('cleaning_target_topic must be str')
+        if not cleaning_target_topic.strip():
+            raise ValueError('cleaning_target_topic must be non-empty')
+        if not isinstance(localization_topic, str):
+            raise TypeError('localization_topic must be str')
+        if not localization_topic.strip():
+            raise ValueError('localization_topic must be non-empty')
+
+        registry = TargetRegistry()
+        pose_provider = LatestRobotPoseProvider()
+        selector = TargetSelector(registry)
+        resolver = VisualTargetGoalResolver(
+            registry=registry,
+            selector=selector,
+            robot_pose_provider=pose_provider,
+            now_ros_ns=self._now_ros_ns,
+        )
+        runtime = self.create_real_runtime(resolver)
+        self._visual_target_registry = registry
+        self._visual_target_pose_provider = pose_provider
+        self._visual_target_bridge = VisualTargetRosBridge(
+            node=self,
+            core=runtime.core,
+            registry=registry,
+            pose_provider=pose_provider,
+            cleaning_target_topic=cleaning_target_topic,
+            localization_topic=localization_topic,
+            on_core_result=self._publish_active_runtime_status,
+        )
+        return runtime
+
+    @property
+    def visual_target_bridge(self) -> VisualTargetRosBridge | None:
+        """Return the explicit visual runtime bridge, when configured."""
+        return self._visual_target_bridge
+
+    def _now_ros_ns(self) -> int:
+        """Return current ROS time in integer nanoseconds."""
+        return int(self.get_clock().now().nanoseconds)
+
+    def _create_runtime(
+        self,
+        *,
+        navigation: NavigationAdapter,
+        safety: SafetyAdapter,
+        goal_resolver: GoalResolver,
+    ) -> RuntimeComposition:
+        """Assemble shared stores, queue, gate and orchestration core."""
+        catalog_share = Path(
+            get_package_share_directory('cleannav_interfaces')
+        )
+        catalog = load_task_catalog(
+            catalog_share / 'config' / 'task_catalog.yaml'
+        )
+
         command_store = CommandRecordStore(32)
+
+        execution_counter = 0
+
+        def make_execution_id() -> str:
+            nonlocal execution_counter
+            execution_counter += 1
+            return f'ros-execution-{execution_counter}'
+
         execution_store = ExecutionRecordStore(
             id_factory=make_execution_id,
             terminal_cache=TerminalStatusCache(32),
         )
         core = MissionManagerCore(
-            validator=catalog.make_validator(),
+            validator=catalog.make_validator(
+                min_confidence_by_source=MIN_CONFIDENCE_BY_SOURCE,
+            ),
             command_store=command_store,
             mission_queue=MissionQueue(32),
             execution_store=execution_store,
@@ -217,7 +337,7 @@ class MissionManagerNode(Node):
             navigation=navigation,
             safety=safety,
             clock=_RosClockAdapter(self),
-            goal_resolver=resolve_goal,
+            goal_resolver=goal_resolver,
         )
         return RuntimeComposition(
             core=core,
@@ -232,25 +352,99 @@ class MissionManagerNode(Node):
         message: TaskCommand,
     ) -> CoreResult | None:
         """Convert and submit one TaskCommand without duplicating policy."""
+        self.get_logger().info(
+            'TASK_RECEIVED '
+            f'task_id={int(message.task_id)} '
+            f'command_id={message.command_id}'
+        )
         try:
             command = ros_task_command_to_normalized(message)
         except RosConversionError as exc:
             self.get_logger().warning(
-                f'Ignoring invalid TaskCommand representation: {exc}'
+                'COMMAND_REJECTED '
+                'reason=ROS_CONVERSION_ERROR '
+                f'task_id={int(message.task_id)} '
+                f'command_id={message.command_id} '
+                f'detail={exc}'
             )
             return None
 
-        self._last_command_id = command.command_id
-        result = self._core.submit_command(command)
-        self._publish_latest_status(
-            command_id=command.command_id,
-            execution_id=getattr(result, 'execution_id', None),
+        self.get_logger().info(
+            'TASK_NORMALIZED '
+            f'task_id={command.task_id} '
+            f'command_id={command.command_id} '
+            f'source={command.source}'
         )
+        self._last_command_id = command.command_id
+        try:
+            result = self._core.submit_command(command)
+        except Exception as exc:
+            self.get_logger().error(
+                'COMMAND_REJECTED '
+                'reason=CORE_EXCEPTION '
+                f'task_id={command.task_id} '
+                f'command_id={command.command_id} '
+                f'detail={exc}'
+            )
+            raise
+        immediate_status = getattr(result, 'status_snapshot', None)
+        if immediate_status is not None:
+            self._publish_status_message(
+                status_snapshot_to_ros(immediate_status)
+            )
+        else:
+            self._publish_latest_status(
+                command_id=command.command_id,
+                execution_id=getattr(result, 'execution_id', None),
+            )
+        execution_id = getattr(result, 'execution_id', None)
+        if getattr(result, 'accepted', False) and execution_id:
+            self.get_logger().info(
+                'EXECUTION_CREATED '
+                f'execution_id={execution_id} '
+                f'command_id={command.command_id}'
+            )
+        elif getattr(result, 'accepted', False):
+            reason = getattr(result, 'reason_code', 'UNKNOWN')
+            reason_name = getattr(reason, 'name', str(reason))
+            self.get_logger().info(
+                'COMMAND_ACCEPTED_NO_EXECUTION '
+                f'reason={reason_name} '
+                f'task_id={command.task_id} '
+                f'command_id={command.command_id}'
+            )
+        elif not getattr(result, 'accepted', False):
+            reason = getattr(result, 'reason_code', 'UNKNOWN')
+            reason_name = getattr(reason, 'name', str(reason))
+            self.get_logger().warning(
+                'COMMAND_REJECTED '
+                f'reason={reason_name} '
+                f'task_id={command.task_id} '
+                f'command_id={command.command_id}'
+            )
         return result
 
     def _on_navigation_event(self, event: NavigationEvent) -> CoreResult:
         """Forward a navigation event, then publish current stored status."""
         result = self._core.handle_navigation_event(event)
+        if event.event_type is NavigationEventType.GOAL_ACCEPTED:
+            self.get_logger().info(
+                'NAVIGATION_STARTED '
+                f'execution_id={event.handle.execution_id}'
+            )
+        elif event.event_type is NavigationEventType.SUCCEEDED:
+            self.get_logger().info(
+                'NAVIGATION_SUCCEEDED '
+                f'execution_id={event.handle.execution_id}'
+            )
+        elif event.event_type in (
+            NavigationEventType.GOAL_REJECTED,
+            NavigationEventType.FAILED,
+        ):
+            self.get_logger().warning(
+                'NAVIGATION_FAILED '
+                f'execution_id={event.handle.execution_id}'
+            )
         execution_id = event.handle.execution_id
         command_id = self._command_id_for_execution(execution_id)
         self._publish_latest_status(
@@ -262,12 +456,30 @@ class MissionManagerNode(Node):
     def _on_safety_event(self, event: SafetyEvent) -> CoreResult:
         """Forward a safety event, then publish current stored status."""
         result = self._core.handle_safety_event(event)
+        if event.event_type is SafetyEventType.LEASE_ACQUIRED:
+            self.get_logger().info(
+                'SAFETY_LEASE_ACQUIRED '
+                f'execution_id={event.execution_id}'
+            )
+        elif event.event_type is SafetyEventType.LEASE_RELEASED:
+            self.get_logger().info(
+                'SAFETY_LEASE_RELEASED '
+                f'execution_id={event.execution_id}'
+            )
         execution_id = event.execution_id
         command_id = self._command_id_for_execution(execution_id)
         self._publish_latest_status(
             command_id=command_id or self._last_command_id,
             execution_id=execution_id,
         )
+        if (
+            event.event_type is SafetyEventType.LEASE_RELEASED
+            and self._core.active_execution is None
+        ):
+            self.get_logger().info(
+                'EXECUTION_FINISHED '
+                f'execution_id={execution_id}'
+            )
         return result
 
     def _command_id_for_execution(
@@ -279,6 +491,20 @@ class MissionManagerNode(Node):
             return None
         record = self._execution_store.get(execution_id)
         return record.command_id if record is not None else None
+
+    def _publish_active_runtime_status(self, result: object) -> None:
+        """Publish status after a visual bridge Core entry point returns."""
+        execution_id = getattr(result, 'execution_id', None)
+        if execution_id is None:
+            active_execution = getattr(self._core, 'active_execution', None)
+            if active_execution is not None:
+                execution_id = active_execution.execution_id
+        if execution_id is None:
+            return
+        self._publish_latest_status(
+            command_id=self._command_id_for_execution(execution_id),
+            execution_id=execution_id,
+        )
 
     def _publish_latest_status(
         self,

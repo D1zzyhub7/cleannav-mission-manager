@@ -36,6 +36,7 @@ def _command() -> TaskCommand:
     message.task_id = 42
     message.confidence = 0.75
     message.raw_text = 'clean'
+    message.user_confirmed = True
     message.valid_for.sec = 3
     message.valid_for.nanosec = 678
     return message
@@ -79,6 +80,7 @@ def test_task_command_conversion_maps_all_fields_and_time_parts():
     assert type(result.confidence) is float
     assert result.confidence == pytest.approx(0.75)
     assert result.raw_text == 'clean'
+    assert result.user_confirmed is True
 
 
 def test_task_command_zero_and_subsecond_times_are_preserved():
@@ -251,4 +253,5 @@ def test_no_robot_status_converter_or_forbidden_runtime_dependency():
         'valid_for_ns',
         'confidence',
         'raw_text',
+        'user_confirmed',
     }

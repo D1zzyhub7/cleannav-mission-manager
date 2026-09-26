@@ -89,6 +89,7 @@ def ros_task_command_to_normalized(
         valid_for_ns=_ros_time_to_ns(message.valid_for, 'valid_for'),
         confidence=float(message.confidence),
         raw_text=message.raw_text,
+        user_confirmed=bool(message.user_confirmed),
     )
 
 
